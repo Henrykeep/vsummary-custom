@@ -1,0 +1,36 @@
+# Environment & local secrets
+.env
+.env.*
+!.env.example
+config/settings.toml
+
+# Local runtime, cache, tools, models, user data & logs
+.cache/
+.tools/
+.vsummary/
+data/
+logs/
+runtime/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node / Frontend
+node_modules/
+dist/
+.vite/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

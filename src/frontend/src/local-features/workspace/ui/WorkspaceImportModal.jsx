@@ -1,0 +1,788 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { X, Loader2, CheckCircle2, AlertCircle, FolderUp, Film, Search } from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
+import { WorkspaceExpandableSelect,WorkspaceImportSelection,useWorkspaceRuntime } from "@alpha03123/vsummary-workspace-ui";
+
+export function WorkspaceImportModal({
+  mode = "series",
+  targetSeriesId = null,
+  targetSeriesTitle = "",
+  onClose,
+  onResolveSeries,
+  onResolveVideo,
+  onInitExternalCookie,
+  onLoadChaoxingStatus,
+  onInitChaoxing,
+  onCancelChaoxingInit,
+  onCancelChaoxingImport,
+  onLoadChaoxingCourses,
+  onImportChaoxingCourse,
+  onSelectLocalMedia,
+  onImportLocalSeries,
+  onImportSeriesVideos,
+  onImportLocalPlaygroundVideos,
+}) {
+  const {api}=useWorkspaceRuntime();
+  const [selection,setSelection]=useState(null);
+  const selectionResolver=useRef(null);
+  function chooseVideos(items){
+    if(items.length===1)return Promise.resolve(items.map(item=>item.id));
+    return new Promise(resolve=>{selectionResolver.current=resolve;setSelection({items,ids:items.map(item=>item.id)});});
+  }
+  function finishSelection(ids){selectionResolver.current?.(ids);selectionResolver.current=null;setSelection(null);}
+  const [sourceType, setSourceType] = useState("local");
+  const [externalProvider, setExternalProvider] = useState("bilibili");
+  const [url, setUrl] = useState("");
+  const [seriesTitle, setSeriesTitle] = useState("");
+  const [sourcePaths, setSourcePaths] = useState([]);
+  const [storageMode, setStorageMode] = useState("hardlink");
+  const [storageModeCustomized, setStorageModeCustomized] = useState(false);
+  const [hardlinkAvailable, setHardlinkAvailable] = useState(true);
+  const [status, setStatus] = useState("idle");
+  const [errorMsg, setErrorMsg] = useState("");
+  const [preview, setPreview] = useState(null);
+  const [chaoxingStatus, setChaoxingStatus] = useState(null);
+  const [chaoxingCourses, setChaoxingCourses] = useState([]);
+  const [chaoxingCourseSearch, setChaoxingCourseSearch] = useState("");
+  const [selectedChaoxingCourseKey, setSelectedChaoxingCourseKey] = useState("");
+  const [chaoxingLoading, setChaoxingLoading] = useState(false);
+  const [externalCookieLoading, setExternalCookieLoading] = useState(false);
+  const [externalCookieConfigured, setExternalCookieConfigured] = useState(false);
+  const [chaoxingImportProgress, setChaoxingImportProgress] = useState(null);
+  const loadChaoxingStatusRef = useRef(onLoadChaoxingStatus);
+  const loadChaoxingCoursesRef = useRef(onLoadChaoxingCourses);
+  const cancelChaoxingInitRef = useRef(onCancelChaoxingInit);
+  const cancelChaoxingImportRef = useRef(onCancelChaoxingImport);
+  const chaoxingImportTaskRef = useRef(null);
+  const initAbortControllerRef = useRef(null);
+  const initInFlightRef = useRef(false);
+  const mountedRef = useRef(true);
+  const backdropPointerDownRef = useRef(false);
+
+  const isSeriesCreation = mode === "series";
+  const isSeriesVideo = mode === "series-video";
+  const title = isSeriesCreation
+    ? "添加系列"
+    : isSeriesVideo
+      ? `添加视频到 ${targetSeriesTitle || "当前系列"}`
+      : "添加 Playground 媒体";
+  const subtitle = sourceType === "external" ? "外部来源" : (isSeriesCreation ? "本地导入" : "媒体导入");
+  const actionLabel = "导入";
+  const chaoxingEnabledForMode = isSeriesCreation;
+  const normalizedChaoxingCourseSearch = chaoxingCourseSearch.trim().toLowerCase();
+  const filteredChaoxingCourses = useMemo(() => {
+    if (!normalizedChaoxingCourseSearch) {
+      return chaoxingCourses;
+    }
+    return chaoxingCourses.filter((course) => {
+      const haystacks = [course.title, course.teacher, course.openTime]
+        .filter((value) => typeof value === "string")
+        .map((value) => value.toLowerCase());
+      return haystacks.some((value) => value.includes(normalizedChaoxingCourseSearch));
+    });
+  }, [chaoxingCourses, normalizedChaoxingCourseSearch]);
+  const selectedFileSummary = useMemo(() => {
+    if (!sourcePaths.length) {
+      return "未选择文件";
+    }
+    if (sourcePaths.length === 1) {
+      return sourcePaths[0].split(/[\\/]/).pop() || sourcePaths[0];
+    }
+    return `已选择 ${sourcePaths.length} 个文件`;
+  }, [sourcePaths]);
+
+  const hasLocalMedia = sourcePaths.length > 0;
+  const hardlinkUnavailable = hasLocalMedia && !hardlinkAvailable;
+  const storageOptions = [
+    {
+      id: "hardlink",
+      label: "硬链接",
+      description: "同一分区共享文件内容；修改源文件也会影响库中视频",
+      disabled: status === "loading" || status === "selecting" || hardlinkUnavailable,
+      disabledReason: hardlinkUnavailable ? "所选文件与 Blob 存储不在同一磁盘分区。" : undefined,
+    },
+    {
+      id: "external_reference",
+      label: "软链接",
+      description: "只记录外部文件路径，移动文件后需要重新关联",
+      disabled: status === "loading" || status === "selecting",
+    },
+    {
+      id: "copy",
+      label: "复制",
+      description: "复制到应用 Blob 存储，原文件保留",
+      disabled: status === "loading" || status === "selecting",
+    },
+  ];
+  const selectedStorageDescription = storageOptions.find((option) => option.id === storageMode)?.description;
+
+  useEffect(() => {
+    loadChaoxingStatusRef.current = onLoadChaoxingStatus;
+    loadChaoxingCoursesRef.current = onLoadChaoxingCourses;
+    cancelChaoxingInitRef.current = onCancelChaoxingInit;
+    cancelChaoxingImportRef.current = onCancelChaoxingImport;
+  }, [onLoadChaoxingStatus, onLoadChaoxingCourses, onCancelChaoxingInit, onCancelChaoxingImport]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      selectionResolver.current?.(null);
+      requestChaoxingInitCancel();
+      requestChaoxingImportCancel();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (sourceType !== "external" || externalProvider !== "chaoxing") {
+      requestChaoxingInitCancel();
+    }
+  }, [sourceType, externalProvider]);
+
+  useEffect(() => {
+    setExternalCookieConfigured(false);
+  }, [externalProvider]);
+
+  useEffect(() => {
+    if (sourceType !== "external" || externalProvider !== "chaoxing" || !chaoxingEnabledForMode) {
+      return;
+    }
+    const loadStatus = loadChaoxingStatusRef.current;
+    const loadCourses = loadChaoxingCoursesRef.current;
+    if (!loadStatus) {
+      return;
+    }
+    let cancelled = false;
+    setChaoxingLoading(true);
+    loadStatus()
+      .then(async (nextStatus) => {
+        if (cancelled) {
+          return;
+        }
+        setChaoxingStatus(nextStatus);
+        if (nextStatus.initialized && loadCourses) {
+          const courses = await loadCourses();
+          if (!cancelled) {
+            setChaoxingCourses(courses);
+            setSelectedChaoxingCourseKey((current) => current || courses[0]?.courseKey || "");
+          }
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setErrorMsg(error instanceof Error ? error.message : "读取超星状态失败");
+          setStatus("error");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setChaoxingLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sourceType, externalProvider, chaoxingEnabledForMode]);
+
+  async function handleInitChaoxing() {
+    if (!onInitChaoxing || !onLoadChaoxingCourses) {
+      return;
+    }
+    const controller = new AbortController();
+    initAbortControllerRef.current = controller;
+    initInFlightRef.current = true;
+    setStatus("loading");
+    setErrorMsg("");
+    setChaoxingLoading(true);
+    try {
+      const nextStatus = await onInitChaoxing({ signal: controller.signal });
+      if (!mountedRef.current) {
+        return;
+      }
+      setChaoxingStatus(nextStatus);
+      const courses = nextStatus.initialized ? await onLoadChaoxingCourses() : [];
+      if (!mountedRef.current) {
+        return;
+      }
+      setChaoxingCourses(courses);
+      setSelectedChaoxingCourseKey(courses[0]?.courseKey || "");
+      setStatus("idle");
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return;
+      }
+      if (!mountedRef.current) {
+        return;
+      }
+      setStatus("error");
+      setErrorMsg(toChaoxingInitErrorMessage(error));
+    } finally {
+      if (initAbortControllerRef.current === controller) {
+        initAbortControllerRef.current = null;
+        initInFlightRef.current = false;
+      }
+      if (mountedRef.current) {
+        setChaoxingLoading(false);
+      }
+    }
+  }
+
+  async function handleInitExternalCookie() {
+    if (!onInitExternalCookie) {
+      return;
+    }
+    setStatus("loading");
+    setErrorMsg("");
+    setExternalCookieLoading(true);
+    try {
+      const result = await onInitExternalCookie(externalProvider);
+      if (!mountedRef.current) {
+        return;
+      }
+      setExternalCookieConfigured(result.configured === true);
+      setStatus("idle");
+    } catch (error) {
+      if (!mountedRef.current) {
+        return;
+      }
+      setStatus("error");
+      setErrorMsg(error instanceof Error ? error.message : "获取平台 Cookie 失败");
+    } finally {
+      if (mountedRef.current) {
+        setExternalCookieLoading(false);
+      }
+    }
+  }
+
+  function requestChaoxingInitCancel() {
+    initAbortControllerRef.current?.abort();
+    if (initInFlightRef.current) {
+      cancelChaoxingInitRef.current?.();
+    }
+  }
+
+  function requestChaoxingImportCancel() {
+    const jobId = chaoxingImportTaskRef.current?.jobId;
+    if (jobId) {
+      cancelChaoxingImportRef.current?.(jobId);
+      chaoxingImportTaskRef.current = null;
+    }
+  }
+
+  function handleClose() {
+    finishSelection(null);
+    requestChaoxingInitCancel();
+    requestChaoxingImportCancel();
+    onClose();
+  }
+
+  async function handleSelectLocalMedia() {
+    if (!onSelectLocalMedia) {
+      return;
+    }
+    setStatus("selecting");
+    setErrorMsg("");
+    try {
+      const selection = await onSelectLocalMedia();
+      if (mountedRef.current) {
+        setSourcePaths(selection.sourcePaths);
+        setHardlinkAvailable(selection.hardlinkAvailable);
+        if (selection.sourcePaths.length) {
+          if (!selection.hardlinkAvailable && storageMode === "hardlink") {
+            setStorageMode("external_reference");
+          } else if (!storageModeCustomized) {
+            setStorageMode(selection.hardlinkAvailable ? "hardlink" : "external_reference");
+          }
+        }
+        setStatus("idle");
+      }
+    } catch (error) {
+      if (mountedRef.current) {
+        setStatus("error");
+        setErrorMsg(error instanceof Error ? error.message : "选择媒体文件失败");
+      }
+    }
+  }
+
+  function handleStorageModeChange(nextStorageMode) {
+    setStorageMode(nextStorageMode);
+    setStorageModeCustomized(true);
+  }
+
+  async function handleSubmit() {
+    setStatus("loading");
+    setErrorMsg("");
+    setPreview(null);
+    setChaoxingImportProgress(null);
+
+    try {
+      let result;
+      if (sourceType === "external") {
+        if (externalProvider === "chaoxing") {
+          if (!selectedChaoxingCourseKey || !onImportChaoxingCourse) {
+            setStatus("idle");
+            return;
+          }
+          result = await onImportChaoxingCourse(selectedChaoxingCourseKey, setChaoxingImportProgress, {
+            onTaskStarted: (task) => {
+              chaoxingImportTaskRef.current = task;
+            },
+          });
+          chaoxingImportTaskRef.current = null;
+        } else {
+          const trimmed = url.trim();
+          if (!trimmed) {
+            setStatus("idle");
+            return;
+          }
+          result = isSeriesCreation
+            ? await (async()=>{
+                const plan=await api.fetchJson('/api/import/linked/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:externalProvider,url:trimmed,title:seriesTitle})});
+                const ids=await chooseVideos(plan.items);
+                if(!ids){await api.fetchJson(`/api/import/previews/${plan.token}`,{method:'DELETE'});return null;}
+                return onResolveSeries(externalProvider,trimmed,{token:plan.token,selectedVideoIds:ids});
+              })()
+            : await onResolveVideo(externalProvider, trimmed, isSeriesVideo ? targetSeriesId : null);
+        }
+      } else {
+        if (!hasLocalMedia) {
+          setStatus("idle");
+          return;
+        }
+        const paths=await chooseVideos(sourcePaths.map(path=>({id:path,title:path.split(/[\\/]/).pop()})));
+        if(!paths){setStatus('idle');return;}
+        result = isSeriesCreation
+            ? await onImportLocalSeries(seriesTitle.trim(), paths, storageMode)
+            : isSeriesVideo
+              ? await onImportSeriesVideos(targetSeriesId, paths)
+              : await onImportLocalPlaygroundVideos(paths);
+      }
+      if(!result){setStatus('idle');return;}
+      setPreview({
+        title: isSeriesCreation ? result.title : (isSeriesVideo ? (targetSeriesTitle || "当前系列") : result.title ?? "Playground"),
+        videoCount: Array.isArray(result) ? result.length : result.videos?.length ?? (sourceType === "external" ? 1 : sourcePaths.length),
+      });
+      setStatus("success");
+    } catch (error) {
+      chaoxingImportTaskRef.current = null;
+      setStatus("error");
+      setErrorMsg(error instanceof Error ? error.message : "导入失败，请检查输入内容");
+    }
+  }
+
+  const submitDisabled = status === "loading" || status === "selecting" || (
+    sourceType === "external"
+      ? (externalProvider === "chaoxing" ? !selectedChaoxingCourseKey || !chaoxingStatus?.initialized : !url.trim())
+      : (isSeriesCreation ? !seriesTitle.trim() || !hasLocalMedia : !hasLocalMedia)
+  );
+
+  return (
+    <><WorkspaceImportSelection open={Boolean(selection)} items={selection?.items??[]} selectedIds={selection?.ids??[]}
+      onChange={ids=>setSelection(current=>({...current,ids}))} onConfirm={finishSelection} onClose={()=>finishSelection(null)}/><AnimatePresence>
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-sm"
+        onPointerDown={(event) => {
+          backdropPointerDownRef.current = event.button === 0 && event.target === event.currentTarget;
+        }}
+        onClick={(event) => {
+          if (backdropPointerDownRef.current && event.target === event.currentTarget) {
+            handleClose();
+          }
+          backdropPointerDownRef.current = false;
+        }}
+      >
+        <motion.div
+          initial={{ opacity: 0, scale: 0.95, y: 16 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          exit={{ opacity: 0, scale: 0.95, y: 16 }}
+          transition={{ type: "spring", stiffness: 380, damping: 28 }}
+          className="workspace-panel w-full max-w-xl overflow-hidden rounded-[2rem] border shadow-2xl"
+        >
+          <div className="flex items-center justify-between border-b border-line/80 p-6">
+            <div className="flex items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-accent/20 bg-accent/10 text-accent">
+                <FolderUp size={18} />
+              </div>
+              <div>
+                <p className="mb-0.5 text-[10px] font-bold uppercase tracking-widest text-subtle">{subtitle}</p>
+                <h2 className="text-base font-bold leading-tight text-strong">{title}</h2>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleClose}
+              className="flex h-8 w-8 items-center justify-center rounded-full text-faint transition-colors hover:bg-soft hover:text-subtle"
+            >
+              <X size={18} />
+            </button>
+          </div>
+
+          <div className="flex flex-col gap-5 p-6">
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                type="button"
+                onClick={() => setSourceType("local")}
+                className={`cursor-pointer rounded-2xl border px-4 py-3 text-left text-sm font-bold transition-colors ${sourceType === "local"
+                    ? "border-accent bg-accent/10 text-accent"
+                    : "border-line bg-surface text-subtle"
+                  }`}
+              >
+                本地媒体
+                <p className="mt-1 text-xs font-medium opacity-70">复制文件到 videos 目录。</p>
+              </button>
+              <button
+                type="button"
+                onClick={() => setSourceType("external")}
+                className={`cursor-pointer rounded-2xl border px-4 py-3 text-left text-sm font-bold transition-colors ${sourceType === "external"
+                    ? "border-accent bg-accent/10 text-accent"
+                    : "border-line bg-surface text-subtle"
+                  }`}
+              >
+                外部来源
+                <p className="mt-1 text-xs font-medium opacity-70">外部API下载</p>
+              </button>
+            </div>
+
+            {sourceType === "external" ? (
+              <div className="space-y-4">
+                {isSeriesCreation && externalProvider !== "chaoxing" && <label className="block">
+                  <span className="mb-2 block text-xs font-bold text-subtle">系列名称</span>
+                  <input type="text" value={seriesTitle} onChange={event=>setSeriesTitle(event.target.value)}
+                    placeholder="选填，留空使用原名称" disabled={status === "loading"}
+                    className="w-full rounded-2xl border border-line bg-surface px-4 py-2.5 text-sm"/>
+                </label>}
+                <div>
+                  <p className="mb-2 text-xs font-bold tracking-wide text-subtle">渠道</p>
+                  <div className="inline-flex rounded-2xl border border-line bg-soft p-1">
+                    <button
+                      type="button"
+                      onClick={() => setExternalProvider("bilibili")}
+                      className={`cursor-pointer rounded-xl px-3.5 py-2 text-xs font-bold transition-colors ${externalProvider === "bilibili"
+                          ? "bg-surface text-accent shadow-sm"
+                          : "text-subtle hover:text-body"
+                        }`}
+                    >
+                      Bilibili
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setExternalProvider("youtube")}
+                      className={`cursor-pointer rounded-xl px-3.5 py-2 text-xs font-bold transition-colors ${externalProvider === "youtube"
+                          ? "bg-surface text-accent shadow-sm"
+                          : "text-subtle hover:text-body"
+                        }`}
+                    >
+                      YouTube
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setExternalProvider("douyin")}
+                      className={`cursor-pointer rounded-xl px-3.5 py-2 text-xs font-bold transition-colors ${externalProvider === "douyin"
+                          ? "bg-surface text-accent shadow-sm"
+                          : "text-subtle hover:text-body"
+                        }`}
+                    >
+                      抖音
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setExternalProvider("chaoxing")}
+                      className={`cursor-pointer rounded-xl px-3.5 py-2 text-xs font-bold transition-colors ${externalProvider === "chaoxing"
+                          ? "bg-surface text-accent shadow-sm"
+                          : "text-subtle hover:text-body"
+                        }`}
+                    >
+                      ChaoXing
+                    </button>
+                  </div>
+                </div>
+                {externalProvider !== "chaoxing" ? (
+                  <>
+                    <label className="mb-2 block text-xs font-bold tracking-wide text-subtle">
+                      {isSeriesCreation
+                        ? `${externalProvider === "youtube" ? "YouTube 播放列表" : externalProvider === "douyin" ? "抖音视频" : "Bilibili 系列 / 多 P"} URL`
+                        : `${externalProvider === "youtube" ? "YouTube" : externalProvider === "douyin" ? "抖音" : "Bilibili"} 视频 URL`}
+                    </label>
+                    <input
+                      type="url"
+                      value={url}
+                      onChange={(event) => setUrl(event.target.value)}
+                      placeholder={externalProvider === "youtube"
+                        ? (isSeriesCreation ? "https://www.youtube.com/playlist?..." : "https://www.youtube.com/watch?v=...")
+                        : externalProvider === "douyin"
+                          ? "https://www.douyin.com/video/..."
+                          : (isSeriesCreation ? "https://www.bilibili.com/video/BV... 或合集链接" : "https://www.bilibili.com/video/BV...")}
+                      disabled={status === "loading" || status === "selecting"}
+                      className="w-full rounded-2xl border border-line bg-surface px-4 py-2.5 text-sm font-medium text-strong transition-all placeholder:text-ghost focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/10 disabled:opacity-60"
+                      autoFocus
+                    />
+                    <p className="mt-2 text-[11px] text-faint">
+                      遇到登录限制或风控时请先获取 Cookie，再重新解析。
+                    </p>
+                    <div className="mt-3 flex flex-wrap items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={handleInitExternalCookie}
+                        disabled={externalCookieLoading || status === "loading"}
+                        className="inline-flex cursor-pointer items-center gap-2 rounded-2xl border border-accent/30 bg-accent/10 px-4 py-2 text-xs font-bold text-accent transition-colors hover:bg-accent/15 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {externalCookieLoading ? <Loader2 size={14} className="animate-spin" /> : null}
+                        {externalCookieLoading ? "等待登录..." : "获取 Cookie"}
+                      </button>
+                      {externalCookieConfigured ? (
+                        <span className="inline-flex items-center gap-1 text-xs font-semibold text-success">
+                          <CheckCircle2 size={14} />
+                          Cookie 已写入
+                        </span>
+                      ) : null}
+                    </div>
+                  </>
+                ) : (
+                  <div className="rounded-2xl border border-line bg-muted p-4">
+                    {!chaoxingEnabledForMode ? (
+                      <p className="text-sm font-semibold text-body">
+                        超星按课程导入为系列，请从“添加系列”入口使用。
+                      </p>
+                    ) : status === "error" && errorMsg ? (
+                      <div className="flex items-center gap-2 text-sm font-semibold text-danger">
+                        <AlertCircle size={16} />
+                        {errorMsg}
+                      </div>
+                    ) : chaoxingLoading ? (
+                      <div className="flex items-center gap-2 text-sm font-semibold text-subtle">
+                        <Loader2 size={16} className="animate-spin" />
+                        等待登录...
+                      </div>
+                    ) : !chaoxingStatus?.initialized ? (
+                      <div className="flex flex-col gap-3">
+                        <div>
+                          <p className="text-sm font-bold text-strong">需要初始化超星登录</p>
+                          <p className="mt-1 text-xs text-subtle">
+                            点击后会打开浏览器，请在浏览器中完成学习通登录。
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleInitChaoxing}
+                          disabled={status === "loading"}
+                          className="inline-flex w-fit cursor-pointer items-center gap-2 rounded-2xl bg-accent px-4 py-2 text-xs font-bold text-on-accent hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {status === "loading" ? <Loader2 size={14} className="animate-spin" /> : null}
+                          开始登陆
+                        </button>
+                      </div>
+                    ) : (
+                      <div>
+                        <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                          <p className="text-xs font-bold tracking-wide text-subtle">选择要导入的课程</p>
+                          <button
+                            type="button"
+                            onClick={handleInitChaoxing}
+                            disabled={status === "loading"}
+                            className="inline-flex w-fit cursor-pointer items-center gap-2 rounded-2xl bg-danger-muted px-4 py-2 text-xs font-bold text-white transition-colors hover:bg-danger-muted/90 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {status === "loading" ? <Loader2 size={14} className="animate-spin" /> : null}
+                            重新登录初始化
+                          </button>
+                        </div>
+                        <div className="relative mb-3">
+                          <Search size={14} className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-faint" />
+                          <input
+                            type="text"
+                            value={chaoxingCourseSearch}
+                            onChange={(event) => setChaoxingCourseSearch(event.target.value)}
+                            placeholder="搜索课程或教师"
+                            className="w-full rounded-2xl border border-line bg-surface px-10 py-2.5 pr-10 text-sm font-medium text-body outline-none transition-colors placeholder:text-ghost focus:border-accent/50 focus:ring-2 focus:ring-accent/10"
+                          />
+                          {chaoxingCourseSearch ? (
+                            <button
+                              type="button"
+                              onClick={() => setChaoxingCourseSearch("")}
+                              className="absolute right-3 top-1/2 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full text-faint transition-colors hover:bg-soft hover:text-body"
+                              aria-label="清空课程搜索"
+                              title="清空课程搜索"
+                            >
+                              <X size={14} />
+                            </button>
+                          ) : null}
+                        </div>
+                        <div className="max-h-56 space-y-2 overflow-auto pr-1">
+                          {filteredChaoxingCourses.length ? filteredChaoxingCourses.map((course) => (
+                            <button
+                              key={course.courseKey}
+                              type="button"
+                              onClick={() => setSelectedChaoxingCourseKey(course.courseKey)}
+                              className={`w-full cursor-pointer rounded-2xl border px-4 py-3 text-left transition-colors ${selectedChaoxingCourseKey === course.courseKey
+                                  ? "border-accent bg-accent/10"
+                                  : "border-line bg-surface"
+                                }`}
+                            >
+                              <p className="text-sm font-bold text-strong">{course.title}</p>
+                              <p className="mt-1 text-xs text-subtle">
+                                {[course.teacher, course.openTime].filter(Boolean).join(" · ") || "超星课程"}
+                              </p>
+                            </button>
+                          )) : (
+                            <p className="rounded-2xl border border-dashed border-line px-4 py-6 text-center text-sm font-semibold text-subtle">
+                              {chaoxingCourses.length ? "没有匹配的课程。" : "没有读取到可导入课程。"}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            ) : isSeriesCreation ? (
+              <div>
+                <label className="mb-2 block text-xs font-bold tracking-wide text-subtle">
+                  系列名称
+                </label>
+                <input
+                  type="text"
+                  value={seriesTitle}
+                  onChange={(event) => setSeriesTitle(event.target.value)}
+                  placeholder="例如：Agent Frameworks"
+                  disabled={status === "loading"}
+                  className="w-full rounded-2xl border border-line bg-surface px-4 py-2.5 text-sm font-medium text-strong transition-all placeholder:text-ghost focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/10 disabled:opacity-60"
+                  autoFocus
+                />
+                <div className="mt-4">
+                  <p className="mb-2 text-xs font-bold tracking-wide text-subtle">媒体存储方式</p>
+                  <WorkspaceExpandableSelect
+                    value={storageMode}
+                    options={storageOptions}
+                    onChange={handleStorageModeChange}
+                    ariaLabel="媒体存储方式"
+                  />
+                  {hasLocalMedia && !hardlinkAvailable ? (
+                    <p className="mt-2 text-xs font-medium text-warning">
+                      所选文件与 Blob 存储不在同一磁盘分区，已默认选择软链接。
+                    </p>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+
+            {sourceType === "local" ? (
+              <div>
+                <label className="mb-2 block text-xs font-bold tracking-wide text-subtle">
+                  选择媒体文件
+                </label>
+                <button
+                  type="button"
+                  onClick={handleSelectLocalMedia}
+                  disabled={status === "loading" || status === "selecting"}
+                  className="flex w-full flex-col gap-2 rounded-2xl border border-dashed border-line-strong bg-muted px-4 py-4 text-left transition hover:border-accent hover:bg-accent/5 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <div className="flex items-center gap-2 text-sm font-semibold text-body">
+                    <Film size={16} />
+                    {selectedFileSummary}
+                  </div>
+                  <p className="text-xs text-subtle">
+                    {isSeriesCreation ? selectedStorageDescription : "点击后可选择多个媒体文件。"}
+                  </p>
+                </button>
+              </div>
+            ) : null}
+
+            {status === "success" && preview ? (
+              <motion.div
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="flex items-center gap-4 rounded-2xl border border-success-border bg-success-subtle p-4"
+              >
+                <CheckCircle2 size={20} className="shrink-0 text-success" />
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-bold text-strong">{preview.title}</p>
+                  <p className="mt-0.5 text-xs text-success">
+                    共 {preview.videoCount} 个视频 · 已导入
+                  </p>
+                </div>
+              </motion.div>
+            ) : null}
+
+            {status === "loading" && sourceType === "external" && externalProvider === "chaoxing" ? (
+              <motion.div
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="rounded-2xl border border-accent/20 bg-accent/5 p-4"
+              >
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <p className="min-w-0 truncate text-xs font-bold text-body">
+                    {chaoxingImportProgress?.detail || "正在导入超星课程..."}
+                  </p>
+                  <p className="shrink-0 text-xs font-bold text-accent">
+                    {typeof chaoxingImportProgress?.progress === "number"
+                      ? `${Math.round(chaoxingImportProgress.progress)}%`
+                      : "处理中"}
+                  </p>
+                </div>
+                <div className="h-2 overflow-hidden rounded-full bg-softer">
+                  <div
+                    className="h-full rounded-full bg-accent transition-all duration-300"
+                    style={{ width: `${Math.max(4, Math.min(100, chaoxingImportProgress?.progress ?? 8))}%` }}
+                  />
+                </div>
+              </motion.div>
+            ) : null}
+
+            {status === "error" ? (
+              <motion.div
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="flex items-start gap-3 rounded-2xl border border-danger-border bg-danger-subtle p-4"
+              >
+                <AlertCircle size={18} className="mt-0.5 shrink-0 text-danger-muted" />
+                <p className="min-w-0 flex-1 text-sm font-medium text-danger">{errorMsg}</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setStatus("idle");
+                    setErrorMsg("");
+                  }}
+                  className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-danger-muted transition-colors hover:bg-danger/15 hover:text-danger"
+                  title="关闭错误提示"
+                  aria-label="关闭错误提示"
+                >
+                  <X size={15} />
+                </button>
+              </motion.div>
+            ) : null}
+          </div>
+
+          <div className="flex justify-end gap-3 px-6 pb-6">
+            <button
+              type="button"
+              onClick={handleClose}
+              className={status === "success"
+                ? "rounded-2xl bg-inverse px-5 py-2.5 text-sm font-bold text-on-inverse shadow-sm transition-opacity hover:opacity-90"
+                : "rounded-2xl bg-soft px-5 py-2.5 text-sm font-semibold text-subtle transition-colors hover:bg-softer"}
+            >
+              {status === "success" ? "完成" : "取消"}
+            </button>
+            <button
+              type="button"
+              onClick={handleSubmit}
+              disabled={submitDisabled}
+              className="inline-flex items-center gap-2 rounded-2xl bg-accent px-5 py-2.5 text-sm font-bold text-on-accent shadow-sm transition-colors hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {status === "loading" ? <Loader2 size={16} className="animate-spin" /> : null}
+              {sourceType === "external" ? (externalProvider === "chaoxing" ? "导入课程" : "解析") : actionLabel}
+            </button>
+          </div>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence></>
+  );
+}
+function toChaoxingInitErrorMessage(error) {
+  const message = error instanceof Error ? error.message : "超星初始化失败";
+  if (message.includes("超星初始化已中断")) {
+    return "超星初始化已中断";
+  }
+  return message;
+}

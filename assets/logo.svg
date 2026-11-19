@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="8 7 50 50" role="img" aria-labelledby="title">
+  <title id="title">VSummary</title>
+  <!-- A play button cut into three episodes: one video, and a series. The two cuts are
+       negative space, so the mark stays a single shape at 16px. -->
+  <style>
+    .mark { fill: #6366F1; stroke: #6366F1; }
+    @media (prefers-color-scheme: dark) { .mark { fill: #818CF8; stroke: #818CF8; } }
+  </style>
+  <defs>
+    <mask id="episodes">
+      <rect width="64" height="64" fill="#fff"/>
+      <path d="M29 0v64M41 0v64" stroke="#000" stroke-width="4.5"/>
+    </mask>
+  </defs>
+  <path class="mark" d="M17 11 17 53 51 32Z" stroke-width="7" stroke-linejoin="round" mask="url(#episodes)"/>
+</svg>

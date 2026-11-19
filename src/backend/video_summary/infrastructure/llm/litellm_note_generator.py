@@ -1,0 +1,534 @@
+"""基于 LiteLLM 的视频 AI 笔记生成器。"""
+
+from __future__ import annotations
+
+from backend.core.preferences import preference_cache_key
+from backend.video_summary.infrastructure.config.user_preferences import load_effective_settings
+
+from dataclasses import replace
+from collections.abc import Generator
+from pathlib import Path
+import re
+from threading import Lock
+from typing import Literal
+
+from pydantic import BaseModel, Field, ValidationError
+
+from backend.video_summary.infrastructure.llm.prompts.notes import build_ai_note_prompt
+from backend.core.citations import CitationReference, CitationSlot
+from backend.shared.llm import LiteLLMCompletionGateway, build_multimodal_user_content
+from backend.shared.llm.usage import LlmUsageCategory, LlmUsageRecorder
+from backend.shared.llm.diagnostics import log_llm_event
+from backend.video_summary.infrastructure.config.settings import ensure_settings_file
+from backend.video_summary.infrastructure.video_summary_runtime import build_litellm_completion_gateway
+from backend.video_summary.library.models import (
+    GeneratedVideoAiNoteDTO,
+    AiSummaryVisualEvidenceDTO,
+    VideoAiNoteVisualContextDTO,
+    VideoSummaryDTO,
+    VideoTranscriptDTO,
+)
+from backend.video_summary.library.usecases.ai_notes import constrain_ai_note_image_markers
+
+
+# 笔记属于创作型任务：温度略高于 0，避免模型挑最保守的写法导致句式死板、篇幅偏短。
+NOTE_TEMPERATURE = 0.3
+
+
+class AiSummaryEvidencePayload(BaseModel):
+    timestamp_seconds: float
+    text: str = Field(min_length=1)
+
+
+class AiSummaryCitationPayload(BaseModel):
+    citation_id: int
+    source_type: Literal["transcript", "visual"]
+    timestamp_seconds: float
+
+
+class AiSummaryPayload(BaseModel):
+    markdown: str = Field(min_length=1)
+    visual_evidence: list[AiSummaryEvidencePayload] = Field(default_factory=list)
+    citations: list[AiSummaryCitationPayload] = Field(default_factory=list)
+
+
+class LiteLLMNoteGenerator:
+    """把已有视频转写整理为一篇 Markdown 笔记。"""
+
+    def __init__(self, gateway: LiteLLMCompletionGateway) -> None:
+        self._gateway = gateway
+
+    def run_ai_summary(self, **kwargs) -> GeneratedVideoAiNoteDTO:
+        workflow = self._ai_summary_requests(**kwargs)
+        messages = next(workflow)
+        while True:
+            payload = self._gateway.complete_structured(messages, response_model=AiSummaryPayload, temperature=NOTE_TEMPERATURE)
+            try:
+                messages = workflow.send(payload)
+            except StopIteration as completed:
+                return completed.value
+
+    async def arun_ai_summary(self, **kwargs) -> GeneratedVideoAiNoteDTO:
+        workflow = self._ai_summary_requests(**kwargs)
+        messages = next(workflow)
+        while True:
+            payload = await self._gateway.acomplete_structured(messages, response_model=AiSummaryPayload, temperature=NOTE_TEMPERATURE)
+            try:
+                messages = workflow.send(payload)
+            except StopIteration as completed:
+                return completed.value
+
+    def _ai_summary_requests(
+        self,
+        *,
+        transcript: VideoTranscriptDTO,
+        summary: VideoSummaryDTO | None,
+        visual_context: VideoAiNoteVisualContextDTO,
+        template: str,
+        multimodal_enabled: bool,
+        note_visual_mode: str,
+        note_max_images: int,
+        note_image_min_gap_seconds: float,
+    ) -> Generator[list[dict[str, object]], AiSummaryPayload, GeneratedVideoAiNoteDTO]:
+        transcript_text = "\n".join(
+            f"[{segment.start_seconds:.3f}-{segment.end_seconds:.3f}] {segment.text.strip()}"
+            for segment in transcript.segments
+            if segment.text.strip()
+        )
+        if not transcript_text:
+            raise ValueError("视频转写为空，无法生成 AI 概括。")
+        prompt = build_ai_note_prompt(
+            title=transcript.title,
+            transcript_text=transcript_text,
+            template=template,
+            summary_text=_extract_summary_text(summary),
+            outline_text=_build_outline_text(summary),
+            visual_context=(
+                visual_context if multimodal_enabled else VideoAiNoteVisualContextDTO(frames=[])
+            ),
+            note_visual_mode=note_visual_mode,
+            note_max_images=note_max_images,
+        ) + (
+            "\n额外输出要求：返回 JSON 对象，包含 markdown、visual_evidence 与 citations。"
+            "markdown 是最终 AI 概括 Markdown；visual_evidence 每项含 timestamp_seconds 和 text。"
+            "仅记录确实能从随附九宫格图确认的画面事实；timestamp_seconds 必须使用给出的真实帧时间。"
+            "citations 至少提供 3 条、最多 20 条，只为需要追溯的关键事实、步骤、数字、直接表述或画面描述建立，避免每一句都引用。"
+            "在对应正文句末写 [citation_id]；citation_id 必须从 1 连续编号且只出现一次。"
+            "source_type=transcript 时 timestamp_seconds 必须精确使用某行转写方括号中的 start 秒数；"
+            "source_type=visual 时 timestamp_seconds 必须逐字复制 visual_evidence 中已返回的真实帧时间，"
+            "不得根据转写、章节或画面内容推断新的时间。"
+        )
+        message_content = (
+            build_multimodal_user_content(text=prompt, image_paths=[frame.image_path for frame in visual_context.frames])
+            if multimodal_enabled and visual_context.frames
+            else prompt
+        )
+        allowed_timestamps = tuple(visual_context.evidence_timestamps)
+        log_llm_event("ai_summary_round_started", round=1,
+            visual_images=len(visual_context.frames) if multimodal_enabled else 0)
+        payload = yield [{"role": "user", "content": message_content}]
+        try:
+            note = _to_generated_note(
+                payload=payload,
+                transcript=transcript,
+                allowed_timestamps=allowed_timestamps,
+                note_visual_mode=note_visual_mode,
+                note_max_images=note_max_images,
+                note_image_min_gap_seconds=note_image_min_gap_seconds,
+            )
+        except ValueError as error:
+            log_llm_event("ai_summary_citation_validation_failed", round=1,
+                reason=[{"location": list(issue["loc"]), "type": issue["type"]}
+                    for issue in error.errors(include_input=False, include_url=False)]
+                    if isinstance(error, ValidationError) else str(error),
+                action="discard_invalid_citations")
+            note = _to_generated_note_with_degraded_citations(
+                payload=payload,
+                transcript=transcript,
+                allowed_timestamps=allowed_timestamps,
+                note_visual_mode=note_visual_mode,
+                note_max_images=note_max_images,
+                note_image_min_gap_seconds=note_image_min_gap_seconds,
+            )
+        return _finalize_ai_summary_images(
+            note=note,
+            duration_seconds=transcript.duration_seconds,
+        )
+
+
+def _finalize_ai_summary_images(
+    *,
+    note: GeneratedVideoAiNoteDTO,
+    duration_seconds: float,
+) -> GeneratedVideoAiNoteDTO:
+    content = constrain_ai_note_image_markers(
+        note.content,
+        duration_seconds=duration_seconds,
+        enabled=note.note_visual_mode == "screenshots",
+        max_images=note.note_max_images,
+        min_gap_seconds=note.note_image_min_gap_seconds,
+    )
+    return replace(note, content=content)
+
+
+def _to_generated_note(
+    *,
+    payload: AiSummaryPayload,
+    transcript: VideoTranscriptDTO,
+    allowed_timestamps: tuple[float, ...],
+    note_visual_mode: str,
+    note_max_images: int,
+    note_image_min_gap_seconds: float,
+) -> GeneratedVideoAiNoteDTO:
+    evidence = _validated_visual_evidence(payload.visual_evidence, allowed_timestamps)
+    markdown, citations = _drop_unverified_visual_citations(
+        markdown=payload.markdown,
+        citations=payload.citations,
+        visual_evidence=evidence,
+    )
+    citations = _build_ai_summary_citations(
+        markdown=markdown,
+        citations=citations,
+        transcript=transcript,
+        visual_evidence=evidence,
+    )
+    return GeneratedVideoAiNoteDTO(
+        content=markdown.strip(),
+        note_visual_mode=note_visual_mode,
+        note_max_images=note_max_images,
+        note_image_min_gap_seconds=note_image_min_gap_seconds,
+        visual_evidence=tuple(evidence),
+        citations=tuple(citations),
+    )
+
+
+def _validated_visual_evidence(
+    evidence_payload: list[AiSummaryEvidencePayload],
+    allowed_timestamps: tuple[float, ...],
+) -> list[AiSummaryVisualEvidenceDTO]:
+    evidence: list[AiSummaryVisualEvidenceDTO] = []
+    seen: set[float] = set()
+    for item in evidence_payload:
+        timestamp = _resolve_visual_evidence_timestamp(item.timestamp_seconds, allowed_timestamps)
+        if timestamp is None or timestamp in seen:
+            continue
+        seen.add(timestamp)
+        evidence.append(AiSummaryVisualEvidenceDTO(timestamp_seconds=timestamp, text=item.text.strip()))
+    return evidence
+
+
+def _to_generated_note_with_degraded_citations(
+    *,
+    payload: AiSummaryPayload,
+    transcript: VideoTranscriptDTO,
+    allowed_timestamps: tuple[float, ...],
+    note_visual_mode: str,
+    note_max_images: int,
+    note_image_min_gap_seconds: float,
+) -> GeneratedVideoAiNoteDTO:
+    """Keep a completed note when the model still returns invalid citation metadata."""
+
+    evidence = _validated_visual_evidence(payload.visual_evidence, allowed_timestamps)
+    markdown, citations = _drop_unverified_citations(
+        markdown=payload.markdown,
+        citations=payload.citations,
+        transcript=transcript,
+        visual_evidence=evidence,
+    )
+    return GeneratedVideoAiNoteDTO(
+        content=markdown.strip(),
+        note_visual_mode=note_visual_mode,
+        note_max_images=note_max_images,
+        note_image_min_gap_seconds=note_image_min_gap_seconds,
+        visual_evidence=tuple(evidence),
+        citations=tuple(_build_ai_summary_citations(
+            markdown=markdown,
+            citations=citations,
+            transcript=transcript,
+            visual_evidence=evidence,
+        )),
+    )
+
+
+class ConfiguredNoteGenerator:
+    """按当前设置懒加载并复用 AI 笔记生成器。"""
+
+    def __init__(self, root_dir: Path, usage_recorder: LlmUsageRecorder | None = None) -> None:
+        self._root_dir = root_dir
+        self._usage_recorder = usage_recorder
+        self._config_path = root_dir / "config" / "settings.toml"
+        self._dotenv_path = root_dir / ".env"
+        self._lock = Lock()
+        self._signature: tuple[object, ...] | None = None
+        self._generator: LiteLLMNoteGenerator | None = None
+
+    def run_ai_summary(
+        self,
+        *,
+        transcript: VideoTranscriptDTO,
+        summary: VideoSummaryDTO | None,
+        visual_context: VideoAiNoteVisualContextDTO,
+        template: str,
+    ) -> GeneratedVideoAiNoteDTO:
+        generator = self._get_generator()
+        settings = load_effective_settings(config_path=self._config_path, root_dir=self._root_dir)
+        return generator.run_ai_summary(
+            transcript=transcript,
+            summary=summary,
+            visual_context=visual_context,
+            template=template,
+            multimodal_enabled=settings.generation.ai_summary_multimodal_enabled,
+            note_visual_mode=settings.generation.note_visual_mode,
+            note_max_images=settings.generation.note_max_images,
+            note_image_min_gap_seconds=settings.generation.note_image_min_gap_seconds,
+        )
+
+    async def arun_ai_summary(self, **kwargs) -> GeneratedVideoAiNoteDTO:
+        generator = self._get_generator()
+        settings = load_effective_settings(config_path=self._config_path, root_dir=self._root_dir)
+        return await generator.arun_ai_summary(**kwargs,
+            multimodal_enabled=settings.generation.ai_summary_multimodal_enabled,
+            note_visual_mode=settings.generation.note_visual_mode,
+            note_max_images=settings.generation.note_max_images,
+            note_image_min_gap_seconds=settings.generation.note_image_min_gap_seconds)
+
+    def _get_generator(self) -> LiteLLMNoteGenerator:
+        ensure_settings_file(self._config_path)
+        signature = (
+            preference_cache_key(),
+            self._config_path.read_text(encoding="utf-8"),
+            self._dotenv_path.read_text(encoding="utf-8") if self._dotenv_path.exists() else "",
+        )
+        with self._lock:
+            if self._generator is None or signature != self._signature:
+                settings = load_effective_settings(config_path=self._config_path, root_dir=self._root_dir)
+                self._generator = LiteLLMNoteGenerator(build_litellm_completion_gateway(
+                    settings,
+                    usage_recorder=self._usage_recorder,
+                    usage_category=LlmUsageCategory.GENERATION if self._usage_recorder is not None else None,
+                ))
+                self._signature = signature
+            return self._generator
+
+
+def _extract_summary_text(summary: VideoSummaryDTO | None) -> str:
+    """取出概况里的核心问题描述。
+
+    只在取值确实是字符串时返回，避免把缺失字段的 `None` 变成 `"None"` 注入提示词。
+    """
+    if summary is None:
+        return ""
+    value = summary.summary.get("core_problem")
+    return str(value).strip() if isinstance(value, str) else ""
+
+
+def _build_outline_text(summary: VideoSummaryDTO | None) -> str:
+    """把概况的章节标题整理成参考大纲。
+
+    笔记生成时参考该大纲，可以让章节划分与原片既有结构保持一致，
+    而不是完全由模型自行切分。
+    """
+    if summary is None:
+        return ""
+    chapters = summary.summary.get("chapters")
+    if not isinstance(chapters, list):
+        return ""
+    lines: list[str] = []
+    for index, chapter in enumerate(chapters, start=1):
+        if not isinstance(chapter, dict):
+            continue
+        chapter_title = str(chapter.get("title") or "").strip()
+        if not chapter_title:
+            continue
+        lines.append(f"{index}. {chapter_title}")
+    return "\n".join(lines)
+
+
+def _format_timestamp(seconds: float) -> str:
+    whole_seconds = max(0, int(seconds))
+    minutes, seconds_part = divmod(whole_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds_part:02d}" if hours else f"{minutes:02d}:{seconds_part:02d}"
+
+
+def _resolve_visual_evidence_timestamp(value: float, allowed: tuple[float, ...]) -> float | None:
+    """把九宫格显示到秒的模型输出回填为真实候选帧时间。"""
+    if not allowed:
+        return None
+    candidate = min(allowed, key=lambda timestamp: abs(timestamp - value))
+    return candidate if abs(candidate - value) <= 1.0 else None
+
+
+def _drop_unverified_visual_citations(
+    *,
+    markdown: str,
+    citations: list[AiSummaryCitationPayload],
+    visual_evidence: list[AiSummaryVisualEvidenceDTO],
+) -> tuple[str, list[AiSummaryCitationPayload]]:
+    """Remove model-only visual references instead of rejecting the whole note."""
+
+    retained = [
+        citation
+        for citation in citations
+        if citation.source_type != "visual" or _resolve_visual_evidence(citation.timestamp_seconds, visual_evidence) is not None
+    ]
+    retained_ids = {citation.citation_id for citation in retained}
+    renumbered_ids = {citation_id: index for index, citation_id in enumerate(sorted(retained_ids), start=1)}
+
+    def replace_marker(match: re.Match[str]) -> str:
+        citation_id = int(match.group(1))
+        if citation_id not in retained_ids:
+            return ""
+        return f"[{renumbered_ids[citation_id]}]"
+
+    normalized_citations = [
+        citation.model_copy(update={"citation_id": renumbered_ids[citation.citation_id]})
+        for citation in retained
+    ]
+    return re.sub(r"\[(\d+)\]", replace_marker, markdown), normalized_citations
+
+
+def _drop_unverified_citations(
+    *,
+    markdown: str,
+    citations: list[AiSummaryCitationPayload],
+    transcript: VideoTranscriptDTO,
+    visual_evidence: list[AiSummaryVisualEvidenceDTO],
+) -> tuple[str, list[AiSummaryCitationPayload]]:
+    """Remove unusable citation markers while retaining verified sources."""
+
+    declared_by_id: dict[int, AiSummaryCitationPayload] = {}
+    duplicate_ids: set[int] = set()
+    for citation in citations:
+        if citation.citation_id in declared_by_id:
+            duplicate_ids.add(citation.citation_id)
+        else:
+            declared_by_id[citation.citation_id] = citation
+    marker_counts: dict[int, int] = {}
+    for match in re.finditer(r"\[(\d+)\]", markdown):
+        citation_id = int(match.group(1))
+        marker_counts[citation_id] = marker_counts.get(citation_id, 0) + 1
+
+    retained_ids = {
+        citation_id
+        for citation_id, citation in declared_by_id.items()
+        if citation_id >= 1
+        and citation_id not in duplicate_ids
+        and marker_counts.get(citation_id) == 1
+        and _citation_is_verified(citation, transcript, visual_evidence)
+    }
+    renumbered_ids = {citation_id: index for index, citation_id in enumerate(sorted(retained_ids), start=1)}
+
+    def replace_marker(match: re.Match[str]) -> str:
+        citation_id = int(match.group(1))
+        return f"[{renumbered_ids[citation_id]}]" if citation_id in retained_ids else ""
+
+    normalized_citations = [
+        declared_by_id[citation_id].model_copy(update={"citation_id": renumbered_ids[citation_id]})
+        for citation_id in sorted(retained_ids)
+    ]
+    return re.sub(r"\[(\d+)\]", replace_marker, markdown), normalized_citations
+
+
+def _citation_is_verified(
+    citation: AiSummaryCitationPayload,
+    transcript: VideoTranscriptDTO,
+    visual_evidence: list[AiSummaryVisualEvidenceDTO],
+) -> bool:
+    if citation.timestamp_seconds < 0:
+        return False
+    if citation.source_type == "transcript":
+        return _resolve_transcript_segment(citation.timestamp_seconds, transcript) is not None
+    return _resolve_visual_evidence(citation.timestamp_seconds, visual_evidence) is not None
+
+
+def _build_ai_summary_citations(
+    *,
+    markdown: str,
+    citations: list[AiSummaryCitationPayload],
+    transcript: VideoTranscriptDTO,
+    visual_evidence: list[AiSummaryVisualEvidenceDTO],
+) -> list[CitationReference]:
+    marker_ids = {int(value) for value in re.findall(r"\[(\d+)\]", markdown)}
+    declared_ids = {item.citation_id for item in citations}
+    if marker_ids != declared_ids:
+        raise ValueError("AI 概括正文中的引用角标必须与 citations 一一对应。")
+    if len(citations) != len(declared_ids):
+        raise ValueError("AI 概括引用 ID 不能重复。")
+    if declared_ids != set(range(1, len(citations) + 1)):
+        raise ValueError("AI 概括引用 ID 必须从 1 连续编号。")
+    if any(item.timestamp_seconds < 0 for item in citations):
+        raise ValueError("AI 概括引用时间不能为负数。")
+
+    result: list[CitationReference] = []
+    for item in sorted(citations, key=lambda citation: citation.citation_id):
+        citation_id = str(item.citation_id)
+        if item.source_type == "transcript":
+            segment = _resolve_transcript_segment(item.timestamp_seconds, transcript)
+            if segment is None:
+                raise ValueError("AI 概括引用了未提供的转写时间。")
+            result.append(
+                CitationReference(
+                    id=citation_id,
+                    label=transcript.title,
+                    source_type="transcript",
+                    search_scope="transcript",
+                    slots=[
+                        CitationSlot(
+                            slot=1,
+                            target_type="video",
+                            video_id=transcript.video_id,
+                            video_title=transcript.title,
+                            start_seconds=segment.start_seconds,
+                            end_seconds=segment.end_seconds,
+                        ),
+                        CitationSlot(
+                            slot=2,
+                            target_type="transcript",
+                            video_id=transcript.video_id,
+                            video_title=transcript.title,
+                            start_seconds=segment.start_seconds,
+                            end_seconds=segment.end_seconds,
+                            text=segment.text,
+                        ),
+                    ],
+                )
+            )
+            continue
+        evidence = _resolve_visual_evidence(item.timestamp_seconds, visual_evidence)
+        if evidence is None:
+            raise ValueError("AI 概括引用了未验证的视觉证据时间。")
+        result.append(
+            CitationReference(
+                id=citation_id,
+                label=transcript.title,
+                source_type="visual",
+                search_scope="visual",
+                slots=[
+                    CitationSlot(
+                        slot=1,
+                        target_type="video",
+                        video_id=transcript.video_id,
+                        video_title=transcript.title,
+                        start_seconds=evidence.timestamp_seconds,
+                        end_seconds=evidence.timestamp_seconds,
+                        text=evidence.text,
+                    )
+                ],
+            )
+        )
+    return result
+
+
+def _resolve_transcript_segment(timestamp: float, transcript: VideoTranscriptDTO):
+    if not transcript.segments:
+        return None
+    candidate = min(transcript.segments, key=lambda segment: abs(segment.start_seconds - timestamp))
+    return candidate if abs(candidate.start_seconds - timestamp) <= 0.01 else None
+
+
+def _resolve_visual_evidence(timestamp: float, evidence: list[AiSummaryVisualEvidenceDTO]) -> AiSummaryVisualEvidenceDTO | None:
+    if not evidence:
+        return None
+    candidate = min(evidence, key=lambda item: abs(item.timestamp_seconds - timestamp))
+    return candidate if abs(candidate.timestamp_seconds - timestamp) <= 1.0 else None

@@ -1,0 +1,1008 @@
+import {useWorkspaceRuntime} from "../../runtime/WorkspaceProvider";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { Captions, LoaderCircle, RefreshCw, X } from "lucide-react";
+import { WorkspaceLibraryPanel } from "./WorkspaceLibraryPanel";
+import { WorkspaceVideoScopePane } from "./WorkspaceVideoScopePane";
+import { WorkspaceToolbar } from "./WorkspaceToolbar";
+import { WorkspaceVideoPlayer } from "./WorkspaceVideoPlayer";
+import { WorkspaceChatPanel, WorkspaceChatSessionManager } from "./WorkspaceChatPanel";
+import { WorkspaceStudioPanels } from "./WorkspaceStudioPanels";
+import { ChatDrawer } from "./ChatDrawer";
+
+import { WorkspaceConfirmDialog } from "./shared/WorkspaceConfirmDialog";
+import { WorkspaceRenameDialog } from "./shared/WorkspaceRenameDialog";
+import { motion, AnimatePresence } from "framer-motion";
+import { useFocusTrap } from "../../shared/lib/useFocusTrap";
+import { matchesNarrowViewport, useNarrowViewport } from "../../shared/lib/useNarrowViewport";
+import { WorkspaceStateBlock } from "./shared/WorkspaceStateBlock";
+import { WorkspaceBackButton } from "./shared/WorkspaceBackButton";
+import { WorkspaceExportMenu } from "./shared/WorkspaceToolHeader";
+import { DEFAULT_SUBTITLE_STYLE, WorkspaceNativeSubtitleSettings } from "./WorkspaceNativeSubtitleSettings";
+import { clampChatDrawerWidth, clampSidebarWidth, createPanelId, getPanelType, getStudioPanelIds, isPanelAllowedForScope, loadWorkspaceLayout, persistWorkspaceLayout, removeStudioPanel, splitStudioPanel, STUDIO_PANEL_TYPES, WORKSPACE_LAYOUT_LIMITS } from "./workspaceLayout";
+import { buildWorkspaceToolExportActions } from "./workspaceToolExports";
+import { isPlaygroundSeries } from "../model/workspaceControllerConstants";
+
+const WorkspaceLibraryHomePane = lazy(() =>
+  import("./WorkspaceLibraryHomePane").then((module) => ({
+    default: module.WorkspaceLibraryHomePane,
+  })),
+);
+
+
+const WorkspaceGenerationOverlay = lazy(() =>
+  import("./WorkspaceGenerationOverlay").then((module) => ({
+    default: module.WorkspaceGenerationOverlay,
+  })),
+);
+
+function focusPaneAnchor(panelId, selector) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
+      const headers = [...document.querySelectorAll("[data-workspace-panel-header]")];
+      const panes = [...document.querySelectorAll("[data-workspace-pane-id]")];
+      const header = headers.find((element) => element.dataset.workspacePanelHeader === panelId);
+      const pane = panes.find((element) => element.dataset.workspacePaneId === panelId);
+      const target = header?.querySelector(selector) ?? pane?.querySelector(selector);
+      target?.focus({ preventScroll: false });
+    });
+  });
+}
+
+export function WorkspacePage({ page, panels = {}, toolbarExtras = null, toolbarTrailing = null, toolbarButtons, brand, sidebarHeader = null, sidebarFooter = null }) {
+  const {Settings: SettingsPanel, Usage: UsagePanel, Import: ImportPanel} = panels;
+  const {api,host}=useWorkspaceRuntime();
+  const mediaPreviewEnabled = host.features?.mediaPreview !== false;
+  const { shell, chat, generation, actions } = page;
+  const visibleError = shell.state.error || generation.videoDownloadError;
+  const {
+    state,
+    ui,
+    library,
+    tools,
+    summary,
+    mindmap,
+    seriesMindmap,
+    seriesMindmapAvailable,
+    seriesOverviewSummariesByVideoId,
+    knowledgeCards,
+    knowledgeCardsGenerating,
+    knowledgeCardsFeedback,
+    notes,
+    activeSeries,
+    selectedVideo,
+    selectedNode,
+    previewUrl,
+    playerSeekRequest,
+    citationFocus,
+    selectedContextType,
+  } = shell;
+  const isNarrow = useNarrowViewport();
+  // Phones show one pane at a time: the main area first, the sidebar on demand, and picking a
+  // video hands the screen back to the main area.
+  const [isSidebarOpen, setIsSidebarOpen] = useState(() => !matchesNarrowViewport());
+  useEffect(() => {
+    if (isNarrow && selectedVideo) setIsSidebarOpen(false);
+  }, [isNarrow, selectedVideo?.id]);
+  const studioScope = selectedContextType === "series" ? "series" : "video";
+  const [layoutsByScope, setLayoutsByScope] = useState(() => ({
+    video: loadWorkspaceLayout("video", state.preferenceStorage),
+    series: loadWorkspaceLayout("series", state.preferenceStorage),
+  }));
+  const savedLayout = layoutsByScope[studioScope];
+  const layout = mediaPreviewEnabled ? savedLayout : {...savedLayout, panelTools: {
+    ...savedLayout.panelTools,
+    ...Object.fromEntries(getStudioPanelIds(savedLayout.studioLayout)
+      .filter(id => (savedLayout.panelTools[id] ?? getPanelType(id)) === 'preview')
+      .map(id => [id, 'overview'])),
+  }};
+  const setLayout = (updater) => setLayoutsByScope((current) => ({
+    ...current,
+    [studioScope]: typeof updater === "function" ? updater(current[studioScope]) : updater,
+  }));
+  const [focusedPanel, setFocusedPanel] = useState("preview::default");
+  const [importModalState, setImportModalState] = useState(null);
+  // A host can resume an import the user started before signing in (Cloud keeps the pasted link).
+  useEffect(() => {
+    const pending = host.takePendingImport?.();
+    if (pending) setImportModalState(pending);
+  }, [host]);
+  const linkStart = host.onboarding?.linkStart ? {
+    onStart: (url) => setImportModalState({ mode: "link", url, autoStart: true }),
+    onUpload: () => setImportModalState({ mode: "series", kind: "upload" }),
+    onUploadFiles: (files) => setImportModalState({ mode: "series", kind: "upload", files }),
+    hint: host.onboarding.hint ?? null,
+    extra: host.onboarding.extra ?? null,
+  } : null;
+  const [pendingDelete, setPendingDelete] = useState(null);
+  const [deletePending, setDeletePending] = useState(false);
+  const [pendingRename, setPendingRename] = useState(null);
+  const [renamePending, setRenamePending] = useState(false);
+  const [playbackTime, setPlaybackTime] = useState(null);
+  const [previewPlaying, setPreviewPlaying] = useState(false);
+  const [previewSubtitlesEnabled, setPreviewSubtitlesEnabled] = useState(false);
+  const [previewSubtitleStyle, setPreviewSubtitleStyle] = useState(DEFAULT_SUBTITLE_STYLE);
+  const [followOverviewPlayback, setFollowOverviewPlayback] = useState(false);
+  const [chatDraft, setChatDraft] = useState("");
+  const chatDrawerTriggerRef = useRef(null);
+  const [resumePosition, setResumePosition] = useState({ videoKey: null, seconds: null });
+  const playbackPositionsRef = useRef(new Map());
+  const containerRef = useRef(null);
+  const settingsModalRef = useRef(null);
+  const usageModalRef = useRef(null);
+  // Engage focus trap on open modals so keyboard users stay inside
+  // (WCAG 2.4.3 Focus Order) and focus returns to the trigger on close.
+  useFocusTrap(settingsModalRef, state.settingsPanelOpen);
+  useFocusTrap(usageModalRef, state.usagePageOpen, { focusFirstField: false });
+  const isPlaygroundHome = isPlaygroundSeries(activeSeries) && !selectedVideo;
+  const chatScopeActive = selectedContextType === "series" || selectedContextType === "video";
+  const chatDrawerOpen = chatScopeActive && chat.drawerOpen;
+  const hasRightPane = Boolean(activeSeries);
+  const currentAsrModel = generation.fasterWhisperModels?.find((model) => model.id === ui.asrModelQuality) ?? null;
+  const summaryLocked = selectedContextType === "series"
+    ? !(activeSeries?.videos ?? []).some((video) => video.processed)
+    : selectedContextType === "video" && selectedVideo?.processed !== true;
+  const chatPanelProps = {
+    workspaceTitle: library?.workspace?.title,
+    activeSeries,
+    selectedVideo,
+    selectedContextType,
+    tools,
+    chatMessages: chat.messages,
+    chatSessions: chat.sessions,
+    activeSessionId: chat.activeSessionId,
+    chatPending: chat.pending,
+    summaryLocked,
+    contextUsage: chat.contextUsage,
+    contextUsageLoading: chat.contextUsageLoading,
+    ragModels: generation.ragModels,
+    knowledgeMemorySnapshot: state.knowledgeMemorySnapshot,
+    draft: chatDraft,
+    onDraftChange: (nextDraft) => {
+      setChatDraft(nextDraft);
+    },
+    onSelectChatSession: chat.selectChatSession,
+    onStartNewChat: chat.startNewChat,
+    onOpenSeekReference: chat.openSeekReference,
+    onOpenCitationReference: openChatCitationReference,
+    onOpenSettings: () => actions.openSettingsPanel("network"),
+    onSubmitChat: chat.submit,
+    onCancelChat: chat.cancel,
+  };
+
+  useEffect(() => {
+    persistWorkspaceLayout(layoutsByScope.video, "video", state.preferenceStorage);
+    persistWorkspaceLayout(layoutsByScope.series, "series", state.preferenceStorage);
+  }, [layoutsByScope]);
+
+  const selectedVideoKey = activeSeries && selectedVideo
+    ? `${activeSeries.id}/${selectedVideo.id}`
+    : null;
+
+  useEffect(() => {
+    setPlaybackTime(null);
+    setPreviewPlaying(false);
+    setFollowOverviewPlayback(false);
+    setResumePosition({
+      videoKey: selectedVideoKey,
+      seconds: selectedVideoKey ? playbackPositionsRef.current.get(selectedVideoKey) ?? null : null,
+    });
+  }, [selectedVideoKey]);
+
+  useEffect(() => {
+    setPreviewSubtitlesEnabled(Boolean(tools?.preview?.subtitleUrl));
+  }, [selectedVideoKey, tools?.preview?.subtitleUrl]);
+
+  function beginResize(startEvent) {
+    startEvent.preventDefault();
+    startEvent.stopPropagation();
+
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+
+    const startX = startEvent.clientX;
+    const startSidebarWidth = layout.sidebarWidth;
+    const containerWidth = container.getBoundingClientRect().width;
+
+    function handlePointerMove(event) {
+      const deltaX = event.clientX - startX;
+      setLayout((current) => ({
+        ...current,
+        sidebarWidth: clampSidebarWidth({
+          proposedWidth: startSidebarWidth + deltaX,
+          containerWidth,
+          hasRightPane,
+        }),
+      }));
+    }
+
+    function handlePointerUp() {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    }
+
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp, { once: true });
+  }
+
+  function handleResizeKeyDown(event) {
+    const containerWidth = containerRef.current?.getBoundingClientRect().width ?? 0;
+    if (!containerWidth) {
+      return;
+    }
+    const proposedWidth = event.key === "ArrowLeft"
+      ? layout.sidebarWidth - 32
+      : event.key === "ArrowRight"
+        ? layout.sidebarWidth + 32
+        : event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? containerWidth
+            : null;
+    if (proposedWidth == null) {
+      return;
+    }
+    event.preventDefault();
+    setLayout((current) => ({
+      ...current,
+      sidebarWidth: clampSidebarWidth({
+        proposedWidth,
+        containerWidth,
+        hasRightPane,
+      }),
+    }));
+  }
+
+  function openStudioPanel(toolId, direction = "row", targetPanelId = focusedPanel) {
+    if ((!mediaPreviewEnabled && toolId === 'preview') || !STUDIO_PANEL_TYPES.has(toolId) || !isPanelAllowedForScope(toolId, studioScope)) {
+      return;
+    }
+    const existingPanel = toolId === "studio" ? null : getStudioPanelIds(layout.studioLayout).find((panelId) => (
+      (layout.panelTools[panelId] ?? getPanelType(panelId)) === toolId
+    ));
+    if (existingPanel) {
+      setFocusedPanel(existingPanel);
+      return;
+    }
+    const panelId = createPanelId(toolId);
+    setLayout((current) => {
+      const resolvedTargetPanelId = targetPanelId ?? getStudioPanelIds(current.studioLayout)[0] ?? null;
+      return {
+        ...current,
+        studioLayout: current.studioLayout && resolvedTargetPanelId
+          ? splitStudioPanel(current.studioLayout, resolvedTargetPanelId, panelId, direction)
+          : panelId,
+        panelTools: { ...current.panelTools, [panelId]: toolId },
+      };
+    });
+    setFocusedPanel(panelId);
+  }
+
+  function openChatCitationReference(reference) {
+    chat.openCitationReference(reference);
+  }
+
+  function setPanelTool(panelId, toolId) {
+    if ((!mediaPreviewEnabled && toolId === 'preview') || !STUDIO_PANEL_TYPES.has(toolId) || !isPanelAllowedForScope(toolId, studioScope)) return;
+    setLayout((current) => ({
+      ...current,
+      panelTools: { ...current.panelTools, [panelId]: toolId },
+    }));
+    setFocusedPanel(panelId);
+    focusPaneAnchor(
+      panelId,
+      toolId === "studio"
+        ? "[data-workspace-tool-index-heading]"
+        : "[data-workspace-pane-title]",
+    );
+  }
+
+  function openVideoTool(videoId, toolId) {
+    if (!activeSeries || !isPanelAllowedForScope(toolId, "video")) {
+      return;
+    }
+    const videoLayout = layoutsByScope.video;
+    const panelIds = getStudioPanelIds(videoLayout.studioLayout);
+    const existingPanelId = panelIds.find((panelId) => (
+      (videoLayout.panelTools[panelId] ?? getPanelType(panelId)) === toolId
+    ));
+    const targetPanelId = existingPanelId ?? panelIds[0] ?? createPanelId(toolId);
+
+    setLayoutsByScope((current) => {
+      const currentVideoLayout = current.video;
+      const currentPanelIds = getStudioPanelIds(currentVideoLayout.studioLayout);
+      const currentExistingPanelId = currentPanelIds.find((panelId) => (
+        (currentVideoLayout.panelTools[panelId] ?? getPanelType(panelId)) === toolId
+      ));
+      const panelId = currentExistingPanelId ?? currentPanelIds[0] ?? targetPanelId;
+      return {
+        ...current,
+        video: {
+          ...currentVideoLayout,
+          studioLayout: currentVideoLayout.studioLayout ?? panelId,
+          panelTools: {
+            ...currentVideoLayout.panelTools,
+            [panelId]: toolId,
+          },
+        },
+      };
+    });
+    setFocusedPanel(targetPanelId);
+    actions.selectVideo(activeSeries.id, videoId);
+    focusPaneAnchor(targetPanelId, "[data-workspace-pane-title]");
+  }
+
+  function closeStudioPanel(panelId) {
+    setLayout((current) => {
+      const panelTools = { ...current.panelTools };
+      delete panelTools[panelId];
+      return {
+        ...current,
+        studioLayout: removeStudioPanel(current.studioLayout, panelId, studioScope, panelTools),
+        panelTools,
+      };
+    });
+    setFocusedPanel((current) => current === panelId ? null : current);
+  }
+
+  function updateChatDrawerWidth(proposedWidth) {
+    setLayout((current) => ({
+      ...current,
+      chatDrawerWidth: clampChatDrawerWidth({ proposedWidth, viewportWidth: window.innerWidth }),
+    }));
+  }
+
+  function renderVideoPlayerPane(onFocusOverviewAtTime = null) {
+    if (selectedVideo) {
+      if (selectedVideo.status === "source_missing") {
+        return (
+          <div className="flex h-full items-center justify-center p-8">
+            <WorkspaceStateBlock
+              title="媒体链接已丢失"
+              description="请在左侧点击“链接媒体”，文件选择框会打开原始文件所在目录。"
+              dashed
+            />
+          </div>
+        );
+      }
+      return (
+        <div className="flex h-full min-h-0 flex-col p-4">
+          <WorkspaceVideoPlayer
+            videoSource={(tools?.preview?.previewUrl ?? previewUrl) ? api.resourceUrl(tools?.preview?.previewUrl ?? previewUrl) : undefined}
+            subtitleSource={tools?.preview?.subtitleUrl ?? null}
+            playerSeekRequest={playerSeekRequest}
+            videoSourceType={selectedVideo?.sourceType}
+            resumeSeconds={resumePosition.videoKey === selectedVideoKey ? resumePosition.seconds : null}
+            onTimeUpdate={(seconds) => {
+              setPlaybackTime(seconds);
+              if (selectedVideoKey && Number.isFinite(seconds) && seconds > 0) {
+                playbackPositionsRef.current.set(selectedVideoKey, seconds);
+              }
+            }}
+            onPlaybackEnded={() => {
+              if (selectedVideoKey) {
+                playbackPositionsRef.current.delete(selectedVideoKey);
+              }
+            }}
+            subtitlesEnabled={previewSubtitlesEnabled}
+            onSubtitlesEnabledChange={setPreviewSubtitlesEnabled}
+            subtitleStyle={previewSubtitleStyle}
+            onSubtitleStyleChange={setPreviewSubtitleStyle}
+            onPlaybackStateChange={setPreviewPlaying}
+            followOverviewPlayback={followOverviewPlayback}
+            onFollowOverviewPlaybackChange={setFollowOverviewPlayback}
+          />
+        </div>
+      );
+    }
+    return (
+      <div className="flex h-full items-center justify-center p-8">
+        <WorkspaceStateBlock
+          title="选择视频以开始预览"
+          description="在左侧选一个视频，这里会显示播放器。"
+          dashed
+        />
+      </div>
+    );
+  }
+
+  function renderStudioPanel(panelId, fallbackToolId) {
+    const toolId = layout.panelTools[panelId] ?? fallbackToolId;
+    if (toolId === "preview") {
+      return renderVideoPlayerPane(actions.focusOverviewAtTime);
+    }
+    if (toolId === "ai-chat") {
+      return <WorkspaceChatPanel {...chatPanelProps} />;
+    }
+    if (toolId === "series-overview" || toolId === "series-mindmap") {
+      return <WorkspaceVideoScopePane page={page} panelToolId={toolId} onPanelSelectTool={(nextTool) => setPanelTool(panelId, nextTool)} onOpenVideoSummary={(videoId) => openVideoTool(videoId, "ai-summary")} embeddedInStudioPanel />;
+    }
+    return <WorkspaceVideoScopePane page={page} panelToolId={toolId} onPanelSelectTool={(nextTool) => setPanelTool(panelId, nextTool)} embeddedInStudioPanel playbackTime={playbackTime} followOverviewPlayback={followOverviewPlayback} onFollowOverviewPlaybackChange={setFollowOverviewPlayback} />;
+  }
+
+  function renderPanelActions(panelId, toolId) {
+    if (toolId === "preview") {
+      const exportActions = buildWorkspaceToolExportActions({ resourceUrl:api.resourceUrl,allowedExports:host.exportOptions,
+        activeSeries,
+        notes,
+        summary,
+        toolId,
+        selectedVideo,
+        tools,
+      });
+      return (
+        <>
+          {exportActions.length ? <WorkspaceExportMenu exportActions={exportActions} /> : null}
+          {tools?.preview?.subtitleUrl ? (
+            <WorkspaceNativeSubtitleSettings
+              subtitlesEnabled={previewSubtitlesEnabled}
+              onSubtitlesEnabledChange={setPreviewSubtitlesEnabled}
+              followOverviewPlayback={followOverviewPlayback}
+              onFollowOverviewPlaybackChange={setFollowOverviewPlayback}
+              style={previewSubtitleStyle}
+              onStyleChange={setPreviewSubtitleStyle}
+            />
+          ) : null}
+        </>
+      );
+    }
+    if (toolId === "studio" || toolId === "ai-chat") {
+      return null;
+    }
+    const exportActions = buildWorkspaceToolExportActions({ resourceUrl:api.resourceUrl,allowedExports:host.exportOptions,
+      activeSeries,
+      notes,
+      summary,
+      toolId,
+      selectedVideo,
+      tools,
+    });
+    return exportActions.length ? <WorkspaceExportMenu exportActions={exportActions} /> : null;
+  }
+
+  function renderPanelTrailingActions(panelId, toolId) {
+    if (toolId === "ai-chat") {
+      return (
+        <WorkspaceChatSessionManager
+          chatSessions={chat.sessions}
+          activeSessionId={chat.activeSessionId}
+          onSelectChatSession={chat.selectChatSession}
+          onStartNewChat={chat.startNewChat}
+        />
+      );
+    }
+    if (toolId !== "preview") {
+      return null;
+    }
+    return (
+      <AnimatePresence initial={false}>
+        {previewPlaying && tools?.overview?.generated === true ? (
+          <motion.div
+            initial={{ opacity: 0, x: 6, scale: 0.96 }}
+            animate={{ opacity: 1, x: 0, scale: 1 }}
+            exit={{ opacity: 0, x: 6, scale: 0.96 }}
+            transition={{ duration: 0.18, ease: "easeOut" }}
+          >
+            <button
+              type="button"
+              onClick={() => actions.focusOverviewAtTime(Number.isFinite(playbackTime) ? playbackTime : 0)}
+              className="inline-flex h-7 items-center gap-1.5 rounded-lg px-2 text-xs font-semibold text-accent transition-colors hover:bg-accent/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 dark:hover:bg-accent/15"
+            >
+              <Captions size={14} aria-hidden="true" />
+              查看当前逐字稿
+            </button>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+    );
+  }
+
+  function renderPanelLeadingActions(panelId, toolId) {
+    if (toolId === "studio") {
+      return null;
+    }
+    const parentLabel = studioScope === "series" ? "系列工具" : "视频工具";
+    return (
+      <WorkspaceBackButton
+        onClick={() => setPanelTool(panelId, "studio")}
+        label={`返回${parentLabel}`}
+        variant="breadcrumb"
+        visibleLabel={parentLabel}
+        compactLabel={studioScope === "series" ? "系列" : "视频"}
+      />
+    );
+  }
+
+  if (state.loading && !summary) {
+    const waitingForBackend = !state.backendReady;
+    return (
+      <div className="flex h-dvh w-full items-center justify-center bg-transparent">
+        <div className="workspace-panel max-w-md rounded-3xl border p-8 text-center">
+          <h1 className="mb-3 text-2xl font-bold text-strong">
+            {waitingForBackend ? "正在启动服务..." : "正在载入知识工作台"}
+          </h1>
+          <p className="text-subtle">
+            {waitingForBackend
+              ? "正在等待后端服务响应，请稍等...."
+              : "正在扫描 `videos/` 目录并构建当前工作区。"}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div ref={containerRef} className="relative flex h-dvh w-full overflow-hidden gap-0 bg-canvas/60 text-strong transition-colors md:gap-3 md:p-3">
+      {/* Left Sidebar: the open series' videos. The home page is a full-width grid of series instead. */}
+      {activeSeries ? (<>
+      <aside
+        style={
+          isSidebarOpen && !isNarrow
+            ? { width: `${layout.sidebarWidth}px` }
+            : undefined
+        }
+        className={`workspace-panel shrink-0 flex flex-col overflow-hidden border-0 md:rounded-[28px] md:border ${
+          isNarrow
+            ? `absolute inset-0 z-40 w-full transition-transform duration-300 ease-in-out ${isSidebarOpen ? "translate-x-0" : "-translate-x-full pointer-events-none"}`
+            : `relative z-10 transition-all duration-300 ease-in-out ${isSidebarOpen ? "opacity-100" : "w-0 opacity-0 border-0 md:border-0 m-0"}`
+        }`}
+        inert={!isSidebarOpen || chatDrawerOpen ? true : undefined}
+      >
+        {isNarrow ? (
+          <button
+            type="button"
+            onClick={() => setIsSidebarOpen(false)}
+            aria-label="收起列表"
+            className="workspace-sidebar-close absolute right-3 top-3 z-20 inline-flex h-10 w-10 items-center justify-center rounded-full bg-surface/70 text-faint backdrop-blur-xl transition-colors hover:bg-soft hover:text-strong"
+          >
+            <X size={18} />
+          </button>
+        ) : null}
+        {sidebarHeader && <div className="shrink-0">{sidebarHeader}</div>}
+        <div className="min-h-0 flex flex-1 flex-col">
+          {(
+            <WorkspaceLibraryPanel
+              activeSeries={activeSeries}
+              indexSnapshot={state.knowledgeMemorySnapshot}
+              selectedContextType={selectedContextType}
+              selectedVideo={selectedVideo}
+              isGeneratingSelectedVideo={generation.isGeneratingSummary}
+              isGeneratingSeries={generation.isGeneratingSeries}
+              seriesGenerationQueue={generation.seriesGenerationQueue}
+              downloadingVideoKey={generation.downloadingVideoKey}
+              onEnterLibraryHome={actions.enterLibraryHome}
+              onSelectSeriesContext={() => {
+                actions.selectSeriesContext();
+                if (isNarrow) setIsSidebarOpen(false);
+              }}
+              onSelectVideo={actions.selectVideo}
+              onGenerateVideo={actions.generateVideo}
+              onProcessLinkedVideo={actions.processLinkedVideo}
+              processingMode={shell.processingMode}
+              onChangeProcessingMode={host.features?.sourceRegeneration === false ? null : actions.changeProcessingMode}
+              allowSourceRegeneration={host.features?.sourceRegeneration !== false}
+              summaryStyleInFooter={host.features?.summaryStyleAtConfirmation !== true}
+              onRelinkVideo={actions.relinkVideo}
+              onGenerateSeries={actions.generateSeries}
+              onCancelGeneration={host.features?.generationCancellation === false ? null : actions.cancelGeneration}
+              onDownloadVideo={actions.downloadVideo}
+              onAddPlaygroundVideo={() => setImportModalState({ mode: "playground" })}
+              onAddSeriesVideo={() => {
+                if (!activeSeries) {
+                  return;
+                }
+                setImportModalState({
+                  mode: "series-video",
+                  targetSeriesId: activeSeries.id,
+                  targetSeriesTitle: activeSeries.title,
+                });
+              }}
+              onDeleteSeries={actions.deleteSeries}
+              onRequestRenameSeries={() => {
+                if (activeSeries) {
+                  setPendingRename({ kind: "series", title: activeSeries.title, entityLabel: "系列名称" });
+                }
+              }}
+              onRequestDeleteSeries={() => {
+                if (!activeSeries) {
+                  return;
+                }
+                setPendingDelete({
+                  kind: "series",
+                  title: "删除整个系列？",
+                  description: `将删除“${activeSeries.title}”及其所有视频与产物。该操作不可撤销。`,
+                });
+              }}
+              onRequestDeleteCurrentVideo={() => {
+                if (!selectedVideo) {
+                  return;
+                }
+                setPendingDelete({
+                  kind: "video",
+                  title: "删除当前视频？",
+                  description: `将删除“${selectedVideo.title}”及其相关产物。该操作不可撤销。`,
+                });
+              }}
+              onRequestBulkDelete={(videoIds) => {
+                const targets = Array.isArray(videoIds) ? [...new Set(videoIds)] : [];
+                if (targets.length === 0) {
+                  return;
+                }
+                setPendingDelete({
+                  kind: "videos",
+                  videoIds: targets,
+                  title: `删除 ${targets.length} 个视频？`,
+                  description: "将删除所选视频及其相关产物。该操作不可撤销。",
+                });
+              }}
+              onRequestRenameCurrentVideo={() => {
+                if (selectedVideo) {
+                  setPendingRename({ kind: "video", title: selectedVideo.title, entityLabel: "视频名称" });
+                }
+              }}
+              downloadProgress={generation.videoDownloadProgress}
+              downloadError={generation.videoDownloadError}
+              downloadErrorKey={generation.videoDownloadErrorKey}
+              currentAsrModel={currentAsrModel}
+              ragModels={generation.ragModels}
+              onOpenSettings={() => actions.openSettingsPanel("ai")}
+            />
+          )}
+        </div>
+        {sidebarFooter && <div className="shrink-0 border-t border-line/70 px-4 py-3">{sidebarFooter}</div>}
+      </aside>
+      {!isNarrow && isSidebarOpen ? (
+        <div
+          role="separator"
+          tabIndex={0}
+          aria-orientation="vertical"
+          aria-label="调整来源列表宽度"
+          aria-valuemin={WORKSPACE_LAYOUT_LIMITS.sidebarMinWidth}
+          aria-valuenow={Math.round(layout.sidebarWidth)}
+          aria-valuetext={`${Math.round(layout.sidebarWidth)} 像素`}
+          inert={chatDrawerOpen ? true : undefined}
+          onPointerDown={beginResize}
+          onKeyDown={handleResizeKeyDown}
+          className="group relative z-30 -mx-1 hidden w-5 shrink-0 cursor-col-resize touch-none outline-none md:block"
+        >
+          <div className="absolute inset-y-0 left-1/2 w-1 -translate-x-1/2 rounded-full bg-softer/80 transition-colors group-hover:bg-accent group-focus-visible:bg-accent dark:group-hover:bg-accent dark:group-focus-visible:bg-accent" />
+        </div>
+      ) : null}
+      </>) : null}
+
+      {/* Main Studio Area */}
+      <main
+        className="workspace-panel relative z-10 flex min-w-0 flex-1 flex-col overflow-hidden border-0 md:rounded-[28px] md:border"
+        inert={chatDrawerOpen ? true : undefined}
+      >
+        <WorkspaceToolbar
+          brand={brand}
+          toolbarExtras={toolbarExtras}
+          toolbarTrailing={toolbarTrailing}
+          toolbarButtons={toolbarButtons}
+          settingsOpen={state.settingsPanelOpen}
+          activeSeries={activeSeries}
+          onEnterLibraryHome={actions.enterLibraryHome}
+          onToggleSettingsPanel={SettingsPanel ? actions.toggleSettingsPanel : null}
+          onOpenUsagePage={UsagePanel ? actions.openUsagePage : null}
+          onOpenUpdate={() => actions.openSettingsPanel("update")}
+          isSidebarOpen={isSidebarOpen}
+          onToggleSidebar={activeSeries ? () => setIsSidebarOpen(!isSidebarOpen) : null}
+          onToggleChatDrawer={chatScopeActive ? chat.toggleDrawer : null}
+          chatDrawerOpen={chatDrawerOpen}
+          assistantButtonRef={chatDrawerTriggerRef}
+        />
+
+        {visibleError && (
+          <div role="alert" className="relative z-20 mx-4 mt-3 flex flex-shrink-0 items-start justify-between gap-4 rounded-[16px] border border-danger-border/70 bg-danger-subtle px-4 py-3 text-sm text-danger md:mx-5">
+            <div className="min-w-0 flex-1 break-words">
+              {visibleError}
+            </div>
+            {typeof actions.clearError === "function" ? (
+              <button
+                type="button"
+                onClick={actions.clearError}
+                className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-danger-muted transition-colors hover:bg-danger-subtle hover:text-danger"
+                title="关闭错误提示"
+                aria-label="关闭错误提示"
+              >
+                <X size={16} />
+              </button>
+            ) : null}
+          </div>
+        )}
+
+        <WorkspaceKnowledgeMemoryStatusBar
+          snapshot={state.knowledgeMemorySnapshot}
+          hasGeneratedContent={Boolean(library?.series?.some((series) => series.videos?.some((video) => video.processed)))}
+        />
+
+        <div className="flex-1 min-h-0 relative overflow-hidden bg-transparent">
+          {!activeSeries ? (
+            <AnimatePresence mode="wait">
+              <Suspense fallback={<WorkspaceSidePaneLoadingState title="正在载入工作区首页" />}>
+                <WorkspaceLibraryHomePane
+                  library={library}
+                  onSelectSeries={(seriesId) => {
+                    actions.selectSeries(seriesId);
+                    if (isNarrow) setIsSidebarOpen(false);
+                  }}
+                  onAddSeries={() => setImportModalState({ mode: "series" })}
+                  onRefreshLibrary={actions.refreshLibrary}
+                  onRequestBulkDelete={(seriesIds) => {
+                    if (seriesIds.length === 0) {
+                      return;
+                    }
+                    setPendingDelete({
+                      kind: "series-batch",
+                      seriesIds,
+                      title: `删除 ${seriesIds.length} 个系列？`,
+                      description: "将删除所选系列、其中的全部视频及产物。该操作不可撤销。",
+                    });
+                  }}
+                  linkStart={linkStart}
+                  showPlayground={host.features?.playground !== false}
+                  inboxComingSoon={host.features?.bilibiliExtension === "coming-soon"}
+                />
+              </Suspense>
+            </AnimatePresence>
+          ) : isPlaygroundHome ? (
+            <div className="flex h-full items-center justify-center p-8"><WorkspaceStateBlock title="选择一个视频开始分析" dashed /></div>
+          ) : (
+            <WorkspaceStudioPanels
+              narrow={isNarrow}
+              layout={layout.studioLayout}
+              panelTools={layout.panelTools}
+              focusedPanel={focusedPanel}
+              onFocus={setFocusedPanel}
+              onClose={closeStudioPanel}
+              onSplit={(panelId, direction) => openStudioPanel("studio", direction, panelId)}
+              onAddPanel={() => openStudioPanel("studio", "row", null)}
+              onLayoutChange={(studioLayout) => setLayout((current) => ({ ...current, studioLayout }))}
+              renderPanel={renderStudioPanel}
+              renderPanelActions={renderPanelActions}
+              renderPanelLeadingActions={renderPanelLeadingActions}
+              renderPanelTrailingActions={renderPanelTrailingActions}
+              contextLabel={studioScope === "series" ? "系列工具" : "视频工具"}
+            />
+          )}
+
+          {/* Loading Overlay when generating AI Summary */}
+          <AnimatePresence>
+            {activeSeries && generation.showOverlay && generation.snapshot && (
+              <Suspense fallback={null}>
+                <WorkspaceGenerationOverlay
+                  generationProgress={generation.progress}
+                  generationSnapshot={generation.snapshot}
+                  mode={shell.processingMode}
+                  title={shell.processingMode === "transcript" ? "正在获取字幕" : generation.isGeneratingSeries ? "正在处理整个系列" : "正在生成 AI 概括"}
+                  onCancel={host.features?.generationCancellation === false ? null : actions.cancelGeneration}
+                  cancelLabel={generation.isGeneratingSeries ? "取消整个系列" : "取消本次生成"}
+                />
+              </Suspense>
+            )}
+          </AnimatePresence>
+        </div>
+
+        {/* Settings Overlay */}
+        <AnimatePresence>
+          {state.settingsPanelOpen && SettingsPanel && (
+            <motion.div
+              ref={settingsModalRef}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              role="dialog"
+              aria-modal="true"
+              aria-label="界面设置"
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  actions.closeSettingsPanel();
+                }
+              }}
+              className="absolute inset-0 z-50 bg-black/20 backdrop-blur-md flex justify-center items-center p-4 md:p-8"
+            >
+              <Suspense fallback={<WorkspaceModalLoadingState />}>
+                <SettingsPanel page={page} />
+              </Suspense>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Usage Overlay */}
+        <AnimatePresence>
+          {state.usagePageOpen && UsagePanel && (
+            <motion.div
+              ref={usageModalRef}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              role="dialog"
+              aria-modal="true"
+              aria-label="API 用量统计"
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  actions.closeUsagePage();
+                }
+              }}
+              className="absolute inset-0 z-50 bg-black/20 backdrop-blur-md flex justify-center items-center p-4 md:p-8"
+            >
+              <Suspense fallback={<WorkspaceModalLoadingState />}>
+                <UsagePanel page={page} />
+              </Suspense>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </main>
+
+      {chatScopeActive ? <ChatDrawer
+        isOpen={chat.drawerOpen}
+        onClose={chat.closeDrawer}
+        restoreFocusRef={chatDrawerTriggerRef}
+        fullWidth={isNarrow}
+        width={layout.chatDrawerWidth}
+        onWidthChange={updateChatDrawerWidth}
+        {...chatPanelProps}
+      /> : null}
+
+      {importModalState && ImportPanel && (
+        <ImportPanel request={importModalState} page={page} onClose={() => setImportModalState(null)} />
+      )}
+
+      <WorkspaceConfirmDialog
+        open={pendingDelete != null}
+        title={pendingDelete?.title ?? ""}
+        description={pendingDelete?.description ?? ""}
+        confirmLabel="确认删除"
+        destructive
+        pending={deletePending}
+        onCancel={() => {
+          if (!deletePending) {
+            setPendingDelete(null);
+          }
+        }}
+        onConfirm={async () => {
+          if (!pendingDelete || deletePending) {
+            return;
+          }
+          setDeletePending(true);
+          try {
+            if (pendingDelete.kind === "series") {
+              await actions.deleteSeries?.();
+            } else if (pendingDelete.kind === "video") {
+              await actions.deleteCurrentVideo?.();
+            } else if (pendingDelete.kind === "videos") {
+              await actions.deleteVideos?.(pendingDelete.videoIds);
+            } else if (pendingDelete.kind === "series-batch") {
+              await actions.deleteSeriesByIds?.(pendingDelete.seriesIds);
+            }
+            setPendingDelete(null);
+          } finally {
+            setDeletePending(false);
+          }
+        }}
+      />
+      <WorkspaceRenameDialog
+        open={pendingRename != null}
+        entityLabel={pendingRename?.entityLabel ?? ""}
+        initialTitle={pendingRename?.title ?? ""}
+        pending={renamePending}
+        onCancel={() => {
+          if (!renamePending) setPendingRename(null);
+        }}
+        onConfirm={async (title) => {
+          if (!pendingRename || renamePending) return;
+          setRenamePending(true);
+          try {
+            if (pendingRename.kind === "series") {
+              await actions.renameSeries?.(title);
+            } else {
+              await actions.renameCurrentVideo?.(title);
+            }
+            setPendingRename(null);
+          } finally {
+            setRenamePending(false);
+          }
+        }}
+      />
+    </div>
+  );
+}
+
+function WorkspaceKnowledgeMemoryStatusBar({ snapshot, hasGeneratedContent }) {
+  const { api } = useWorkspaceRuntime();
+  const [dismissedSnapshotKey, setDismissedSnapshotKey] = useState(null);
+  const [rebuildPending, setRebuildPending] = useState(false);
+  const [rebuildError, setRebuildError] = useState(null);
+  useEffect(() => {
+    if (snapshot?.status === "running" || snapshot?.indexState === "ready") setRebuildPending(false);
+  }, [snapshot]);
+  const isRunning = snapshot?.status === "running";
+  // Nothing generated means nothing to search yet: a "missing index" then is not the user's problem.
+  if (!snapshot || (snapshot.indexState === "ready" && !isRunning) || (!hasGeneratedContent && !isRunning)) {
+    return null;
+  }
+  const snapshotKey = `${snapshot.indexState}:${snapshot.status}:${snapshot.requestedRevision}:${snapshot.sequence ?? 0}`;
+  if (dismissedSnapshotKey === snapshotKey) {
+    return null;
+  }
+  const isFailed = snapshot.status === "failed" || snapshot.indexState === "failed";
+  const progressText = isRunning && typeof snapshot.progress === "number" ? ` · ${Math.round(snapshot.progress)}%` : "";
+  const message = isRunning
+    ? `正在更新检索${progressText}`
+    : isFailed
+      ? `检索更新失败${rebuildError ?? snapshot.indexError ?? snapshot.error ? `：${rebuildError ?? snapshot.indexError ?? snapshot.error}` : ""}`
+      : snapshot.indexState === "unknown"
+        ? "暂时无法确认检索状态"
+        : "有新内容还没加入检索，AI 对话可能找不到它们";
+  const canRebuild = !isRunning && snapshot.indexState !== "unknown";
+  const rebuildIndex = async () => {
+    setRebuildPending(true);
+    setRebuildError(null);
+    try {
+      await api.fetchJson("/api/workspace/index/refresh", { method: "POST" });
+    } catch (error) {
+      setRebuildPending(false);
+      setRebuildError(error instanceof Error ? error.message : "提交失败");
+    }
+  };
+
+  return (
+    <div role="status" className={`mx-6 mt-3 flex items-center gap-2.5 rounded-xl border px-3 py-2 text-xs ${isFailed ? "border-danger/40 bg-danger-subtle text-danger" : "border-line bg-muted text-subtle"}`}>
+      {isRunning ? (
+        <LoaderCircle size={14} className="shrink-0 animate-spin text-accent" />
+      ) : (
+        <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${isFailed ? "bg-danger" : "bg-warning"}`} />
+      )}
+      <p className="min-w-0 flex-1 break-words">{message}</p>
+      {canRebuild ? (
+        <button type="button" onClick={rebuildIndex} disabled={rebuildPending}
+          className="inline-flex shrink-0 items-center gap-1 rounded-lg px-2 py-1 font-semibold text-accent hover:bg-accent/10 disabled:opacity-50">
+          <RefreshCw size={12} className={rebuildPending ? "animate-spin" : ""} />
+          {isFailed ? "重试" : "更新"}
+        </button>
+      ) : null}
+      <button
+        type="button"
+        onClick={() => setDismissedSnapshotKey(snapshotKey)}
+        className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md opacity-60 transition-colors hover:bg-black/5 hover:opacity-100 dark:hover:bg-soft"
+        aria-label="关闭提示"
+      >
+        <X size={14} />
+      </button>
+    </div>
+  );
+}
+
+function WorkspaceSidePaneLoadingState({ title }) {
+  return (
+    <section className="flex-1 min-w-[320px] h-full overflow-y-auto relative z-10 border-l border-line/80 transition-all">
+      <div className="flex h-full items-center justify-center p-8">
+        <WorkspaceStateBlock title={title} loading />
+      </div>
+    </section>
+  );
+}
+
+function WorkspaceModalLoadingState() {
+  return (
+    <div className="workspace-panel flex w-full max-w-xl items-center justify-center rounded-4xl border p-10">
+      <WorkspaceStateBlock
+        title="正在载入设置面板"
+        loading
+      />
+    </div>
+  );
+}

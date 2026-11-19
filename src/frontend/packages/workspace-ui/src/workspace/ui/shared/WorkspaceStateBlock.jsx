@@ -1,0 +1,56 @@
+import { LoaderCircle } from "lucide-react";
+import { twMerge } from "tailwind-merge";
+
+export function WorkspaceStateBlock({
+  title,
+  description,
+  children,
+  tone = "default",
+  loading = false,
+  dashed = false,
+  centered = true,
+  actionLabel = "",
+  actionIcon = null,
+  actionDisabled = false,
+  onAction = null,
+  className,
+}) {
+  const toneClassName =
+    tone === "accent"
+      ? "workspace-accent-panel"
+      : tone === "elevated"
+        ? "workspace-elevated-panel"
+        : "workspace-muted-panel";
+
+  return (
+    <div
+      className={twMerge(`${toneClassName} flex min-h-[320px] rounded-3xl border mt-10 p-6 ${
+        centered ? "items-center justify-center text-center" : ""
+      } ${dashed ? "border-dashed" : ""}`,className)}
+    >
+      <div className={`${centered ? "max-w-md" : "w-full"}`}>
+        {loading ? (
+          <div className="mx-auto mb-4 inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-surface/90 text-accent shadow-sm">
+            <LoaderCircle size={20} strokeWidth={2.2} className="animate-spin" />
+          </div>
+        ) : null}
+        <h3 className="mt-3 text-2xl font-bold text-strong">{title}</h3>
+        {description ? (
+          <p className="mt-3 text-sm leading-relaxed text-subtle">{description}</p>
+        ) : null}
+        {actionLabel && typeof onAction === "function" ? (
+          <button
+            type="button"
+            onClick={onAction}
+            disabled={actionDisabled}
+            className="mt-5 inline-flex items-center justify-center gap-2 rounded-xl border border-accent/40 bg-accent/10 px-4 py-2.5 text-sm font-semibold text-accent transition-colors hover:bg-accent/15 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {actionIcon}
+            {actionLabel}
+          </button>
+        ) : null}
+        {children ? <div className="mt-5">{children}</div> : null}
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,375 @@
+"""从 Bilibili、YouTube 与本地媒体读取可直接使用的中文字幕转写。"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import subprocess
+from typing import Protocol
+from urllib.parse import urlparse
+
+import srt
+
+from backend.shared.bilibili_ytdlp import (
+    load_bilibili_headers,
+    resolve_yt_dlp_proxy,
+)
+from backend.shared.ytdlp import run_with_cookie_fallback, temporary_cookie_file, requires_cookie, CookieRequiredError
+from backend.video_summary.domain.models import ManualTranscriptInput, Transcript, TranscriptSegment
+from backend.video_summary.generation.cancellation import GenerationCancellationContext, ProcessHandle
+
+LOGGER = logging.getLogger(__name__)
+
+_BVID_PATTERN = re.compile(r"(BV[0-9A-Za-z]{10})", re.IGNORECASE)
+_TEXT_SUBTITLE_CODECS = frozenset({"ass", "mov_text", "srt", "ssa", "subrip", "webvtt"})
+_LOCAL_CHINESE_LANGUAGE_PRIORITY = ("zh-hans", "zh-cn", "zh", "zho", "chi", "cmn")
+_BILIBILI_CHINESE_LANGUAGE_PRIORITY = ("zh-Hans", "zh-CN", "zh", "ai-zh")
+_YOUTUBE_HOSTS = frozenset({"www.youtube.com", "youtube.com", "m.youtube.com", "youtu.be"})
+_YOUTUBE_CHINESE_LANGUAGE_PRIORITY = ("zh-Hans", "zh-CN", "zh", "zh-SG", "zh-Hant", "zh-TW", "zh-HK")
+
+
+class BilibiliSubtitleFallback(Protocol):
+    """宿主提供的 Bilibili 字幕备用来源，只在直连读取失败时调用。"""
+
+    def load(self, source_url: str) -> Transcript | None: ...
+
+
+class _BilibiliSubtitleFailed(Exception):
+    """直连 Bilibili 读取字幕出错（区别于读取成功但没有中文字幕）。"""
+
+
+class SubtitleTranscriptProvider:
+    """按平台字幕（Bilibili / YouTube）、内嵌字幕的顺序尝试获得中文字幕转写。"""
+
+    cache_identity = "subtitle-transcript-v1"
+
+    def __init__(self, bilibili_fallback: BilibiliSubtitleFallback | None = None) -> None:
+        self._bilibili_fallback = bilibili_fallback
+
+    def load(
+        self,
+        video_path: Path,
+        staging_dir: Path,
+        cancellation: GenerationCancellationContext | None = None,
+        *,
+        source_url: str = "",
+    ) -> Transcript | None:
+        """返回可用中文字幕；找不到时返回 ``None`` 以让调用方走 ASR。"""
+        if urlparse(source_url).hostname in _YOUTUBE_HOSTS:
+            platform = _load_youtube_subtitle(source_url, cancellation)
+        else:
+            try:
+                platform = _load_bilibili_subtitle(source_url, cancellation)
+            except _BilibiliSubtitleFailed:
+                platform = self._load_bilibili_fallback(source_url, cancellation)
+        if platform is not None:
+            return platform
+        return _load_embedded_subtitle(video_path, staging_dir / "subtitle.srt", cancellation)
+
+    def _load_bilibili_fallback(
+        self,
+        source_url: str,
+        cancellation: GenerationCancellationContext | None,
+    ) -> Transcript | None:
+        if self._bilibili_fallback is None:
+            return None
+        try:
+            transcript = self._bilibili_fallback.load(source_url)
+        except Exception:
+            LOGGER.warning("Bilibili 字幕备用来源读取失败，回退 ASR：%s", source_url, exc_info=True)
+            transcript = None
+        _raise_if_cancelled(cancellation)
+        return transcript
+
+
+class ManualSrtTranscriptProvider:
+    """读取当前视频已提交的人工 SRT。"""
+
+    def load(self, output_dir: Path) -> ManualTranscriptInput | None:
+        path = output_dir / "transcript.manual.srt"
+        if not path.is_file():
+            return None
+        raw_srt = path.read_text(encoding="utf-8-sig")
+        return ManualTranscriptInput(
+            transcript=parse_srt_transcript(raw_srt),
+            raw_srt=raw_srt,
+            filename=path.name,
+        )
+
+
+class CleanedTranscriptProvider:
+    """读取已经提交的 ``transcript.cleaned.json``。"""
+
+    def load(self, output_dir: Path) -> Transcript | None:
+        path = output_dir / "transcript.cleaned.json"
+        if not path.is_file():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        segments = [
+            TranscriptSegment(
+                start_seconds=float(item["start_seconds"]),
+                end_seconds=float(item["end_seconds"]),
+                text=str(item["text"]).strip(),
+            )
+            for item in payload.get("segments", [])
+            if isinstance(item, dict) and str(item.get("text", "")).strip()
+        ]
+        if not segments:
+            raise ValueError(f"标准转写没有有效片段：{path}")
+        return Transcript(language=str(payload.get("language", "")).strip() or "und", segments=segments)
+
+
+class _SilentYtDlpLogger:
+    """阻止 listsubtitles 将轨道表直接写入后端 stdout。"""
+
+    def __init__(self) -> None:
+        self.authentication_required = False
+
+    def debug(self, message: str) -> None:
+        LOGGER.debug("yt-dlp: %s", message)
+
+    def warning(self, message: str) -> None:
+        self.authentication_required |= requires_cookie(RuntimeError(message))
+        LOGGER.warning("yt-dlp: %s", message)
+
+    def error(self, message: str) -> None:
+        LOGGER.warning("yt-dlp: %s", message)
+
+
+def _load_bilibili_subtitle(
+    source_url: str,
+    cancellation: GenerationCancellationContext | None = None,
+) -> Transcript | None:
+    parsed = urlparse(source_url)
+    if parsed.hostname not in {"www.bilibili.com", "bilibili.com"}:
+        return None
+    bvid_match = _BVID_PATTERN.search(parsed.path)
+    if bvid_match is None:
+        raise ValueError("Bilibili 字幕来源链接缺少有效 BV 号。")
+    _raise_if_cancelled(cancellation)
+    bvid = bvid_match.group(1)
+    headers = load_bilibili_headers(bvid)
+    cookie = headers.pop("Cookie", "")
+    options: dict[str, object] = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "extract_flat": False,
+        "listsubtitles": True,
+        "socket_timeout": 20,
+        "http_headers": headers,
+    }
+    proxy = resolve_yt_dlp_proxy()
+    if proxy is not None:
+        options["proxy"] = proxy
+    def extract(cookie: str) -> Transcript | None:
+        _raise_if_cancelled(cancellation)
+        from yt_dlp import YoutubeDL
+        logger = _SilentYtDlpLogger()
+        with temporary_cookie_file(cookie, "bilibili.com") as cookie_file:
+            attempt_options = {**options, "logger": logger}
+            if cookie_file is not None:
+                attempt_options["cookiefile"] = str(cookie_file)
+            with YoutubeDL(attempt_options) as ydl:
+                ydl.to_screen = _discard_ytdlp_screen_output
+                ydl.to_stdout = _discard_ytdlp_screen_output
+                info = ydl.extract_info(source_url, download=False)
+        _raise_if_cancelled(cancellation)
+        if not isinstance(info, dict):
+            return None
+        subtitles = info.get("subtitles")
+        if not isinstance(subtitles, dict):
+            if logger.authentication_required:
+                raise CookieRequiredError("Bilibili subtitles require login.")
+            return None
+        for language in _BILIBILI_CHINESE_LANGUAGE_PRIORITY:
+            entries = subtitles.get(language)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("ext") != "srt":
+                    continue
+                data = entry.get("data")
+                if isinstance(data, str) and data.strip():
+                    return parse_srt_transcript(data)
+        if logger.authentication_required:
+            raise CookieRequiredError("Bilibili subtitles require login.")
+        return None
+    try:
+        return run_with_cookie_fallback(extract, cookie)
+    except InterruptedError:
+        raise
+    except Exception:
+        _raise_if_cancelled(cancellation)
+        LOGGER.warning("Bilibili 中文字幕读取失败：%s", bvid, exc_info=True)
+        raise _BilibiliSubtitleFailed(bvid) from None
+
+
+def _load_youtube_subtitle(
+    source_url: str,
+    cancellation: GenerationCancellationContext | None = None,
+) -> Transcript | None:
+    """只读作者上传的中文字幕；YouTube 自动生成或自动翻译的字幕碎片多、没有标点，不如 ASR。"""
+    options: dict[str, object] = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "socket_timeout": 20,
+    }
+
+    def extract(cookie: str) -> Transcript | None:
+        _raise_if_cancelled(cancellation)
+        from yt_dlp import YoutubeDL
+        with temporary_cookie_file(cookie, "youtube.com") as cookie_file:
+            attempt_options = {**options, "logger": _SilentYtDlpLogger()}
+            if cookie_file is not None:
+                attempt_options["cookiefile"] = str(cookie_file)
+            with YoutubeDL(attempt_options) as ydl:
+                ydl.to_screen = _discard_ytdlp_screen_output
+                ydl.to_stdout = _discard_ytdlp_screen_output
+                info = ydl.extract_info(source_url, download=False)
+                subtitles = info.get("subtitles") if isinstance(info, dict) else None
+                if not isinstance(subtitles, dict):
+                    return None
+                languages = [code for code in _YOUTUBE_CHINESE_LANGUAGE_PRIORITY if code in subtitles]
+                languages += sorted(code for code in subtitles if code.lower().startswith("zh") and code not in languages)
+                for language in languages:
+                    for entry in subtitles[language]:
+                        if isinstance(entry, dict) and entry.get("ext") == "srt" and entry.get("url"):
+                            _raise_if_cancelled(cancellation)
+                            content = ydl.urlopen(entry["url"]).read().decode("utf-8-sig")
+                            if content.strip():
+                                return parse_srt_transcript(content)
+        return None
+
+    try:
+        return run_with_cookie_fallback(extract, os.environ.get("YOUTUBE_COOKIE", ""))
+    except InterruptedError:
+        raise
+    except Exception:
+        _raise_if_cancelled(cancellation)
+        LOGGER.warning("YouTube 中文字幕读取失败，回退 ASR：%s", source_url, exc_info=True)
+        return None
+
+
+def _load_embedded_subtitle(
+    video_path: Path,
+    output_path: Path,
+    cancellation: GenerationCancellationContext | None = None,
+) -> Transcript | None:
+    try:
+        stream_index = _find_chinese_text_subtitle_stream(video_path, cancellation)
+        if stream_index is None:
+            return None
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        _run_subprocess(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-y",
+                "-i",
+                str(video_path),
+                "-map",
+                f"0:{stream_index}",
+                str(output_path),
+            ],
+            cancellation,
+        )
+        return parse_srt_transcript(output_path.read_text(encoding="utf-8-sig"))
+    except InterruptedError:
+        raise
+    except Exception:
+        _raise_if_cancelled(cancellation)
+        LOGGER.warning("内嵌中文字幕读取失败，回退 ASR：%s", video_path, exc_info=True)
+        return None
+    finally:
+        output_path.unlink(missing_ok=True)
+
+
+def _find_chinese_text_subtitle_stream(
+    video_path: Path,
+    cancellation: GenerationCancellationContext | None = None,
+) -> int | None:
+    result = _run_subprocess(
+        ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(video_path)],
+        cancellation,
+    )
+    payload = json.loads(result.stdout)
+    streams = payload.get("streams")
+    if not isinstance(streams, list):
+        return None
+    candidates: list[tuple[int, int]] = []
+    for stream in streams:
+        if not isinstance(stream, dict) or stream.get("codec_type") != "subtitle":
+            continue
+        codec = str(stream.get("codec_name", "")).lower()
+        tags = stream.get("tags")
+        language = str(tags.get("language", "")).lower() if isinstance(tags, dict) else ""
+        if codec not in _TEXT_SUBTITLE_CODECS or language not in _LOCAL_CHINESE_LANGUAGE_PRIORITY:
+            continue
+        index = stream.get("index")
+        if not isinstance(index, int):
+            continue
+        candidates.append((_LOCAL_CHINESE_LANGUAGE_PRIORITY.index(language), index))
+    return min(candidates)[1] if candidates else None
+
+
+def _run_subprocess(
+    command: list[str],
+    cancellation: GenerationCancellationContext | None = None,
+) -> subprocess.CompletedProcess[str]:
+    _raise_if_cancelled(cancellation)
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    handle = ProcessHandle(_proc=process)
+    if cancellation is not None:
+        cancellation.register(handle)
+        if cancellation.cancel_requested:
+            process.kill()
+    try:
+        stdout, stderr = process.communicate()
+    finally:
+        if cancellation is not None:
+            cancellation.unregister(handle)
+    _raise_if_cancelled(cancellation)
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(process.returncode, command, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def parse_srt_transcript(content: str) -> Transcript:
+    """将非空 SRT 文本转换为按时间排序的中文 ``Transcript``。"""
+    subtitles = list(srt.parse(content))
+    segments = [
+        TranscriptSegment(
+            start_seconds=item.start.total_seconds(),
+            end_seconds=item.end.total_seconds(),
+            text=item.content.strip(),
+        )
+        for item in subtitles
+        if item.content.strip() and item.end > item.start
+    ]
+    if not segments:
+        raise ValueError("字幕中没有有效时间片段。")
+    return Transcript(language="zh", segments=segments)
+
+
+def _discard_ytdlp_screen_output(*args: object, **kwargs: object) -> None:
+    """字幕枚举是内部步骤，不向后端 stdout 输出 yt-dlp 的轨道表。"""
+
+
+def _raise_if_cancelled(cancellation: GenerationCancellationContext | None) -> None:
+    if cancellation is not None and cancellation.cancel_requested:
+        raise InterruptedError("任务已取消")

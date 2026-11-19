@@ -1,0 +1,1361 @@
+import { useEffect, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { popScaleVariant, blurVariant } from "@alpha03123/vsummary-workspace-ui";
+import { Settings2, Cpu, Key, FileText, X, LoaderCircle, Download, Check, RefreshCw } from "lucide-react";
+import {
+  WorkspaceProviderSelect,
+  WorkspaceAdvancedSettings,
+  WorkspaceSegmentedControl,
+  WorkspaceMultiSelect,
+  WorkspaceSelect,
+  WorkspaceSettingRow,
+  WorkspaceTextInput,
+  WorkspaceToggleSwitch,
+} from "@alpha03123/vsummary-workspace-ui";
+import { MODEL_DOWNLOAD_FAILED_MESSAGE } from "../model/modelDownloadMessages";
+import { WorkspaceLegacyMigrationPanel } from "./WorkspaceLegacyMigrationPanel";
+
+export function WorkspaceSettingsPanel({
+  ui,
+  initialTab = "general",
+  fasterWhisperModels,
+  fasterWhisperModelsLoading,
+  ragModels = [],
+  ragModelsLoading = false,
+  ragModelsError = "",
+  downloadingRagModelKey = null,
+  downloadingModelId,
+  modelDownloadsById = {},
+  modelDownloadStatus = null,
+  modelDownloadProgress,
+  modelDownloadErrorModelId = null,
+  modelDownloadError = null,
+  onChangeSetting,
+  onOpenUsagePage,
+  onSaveProviderSettings,
+  onSelectProviderModel,
+  onDiscoverProviderModels,
+  onSaveApiKey,
+  onSaveAsrSettings,
+  onRevealAsrApiKey,
+  onTestAsrConnection,
+  onRevealOpenaiApiKey,
+  onTestProviderConnection,
+  onDownloadFasterWhisperModel,
+  onCancelFasterWhisperModelDownload,
+  onDownloadRagModel,
+  onCancelRagModelDownload,
+  onCheckApplicationUpdate,
+  onScheduleApplicationUpdate,
+  onSelectLegacyMigrationSource,
+  onInspectLegacyMigration,
+  onCreateLegacyMigrationRun,
+  onStartLegacyMigrationRun,
+  onLoadLegacyMigrationRun,
+  onLoadLatestLegacyMigrationRun,
+  onCancelLegacyMigrationRun,
+  onResetSettings,
+  onClose,
+}) {
+  const [activeTab, setActiveTab] = useState(initialTab);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [confirmDownloadModelId, setConfirmDownloadModelId] = useState(null);
+  const [showApiKeyValue, setShowApiKeyValue] = useState(false);
+  const [showAsrApiKeyValue, setShowAsrApiKeyValue] = useState(false);
+  const [apiKeyRevealLoading, setApiKeyRevealLoading] = useState(false);
+  const [asrApiKeyRevealLoading, setAsrApiKeyRevealLoading] = useState(false);
+  const [providerTest, setProviderTest] = useState({ status: "idle", message: "" });
+  const [asrTest, setAsrTest] = useState({ status: "idle", message: "" });
+  const [detectedProviderModels, setDetectedProviderModels] = useState([]);
+  const [providerModelDiscovery, setProviderModelDiscovery] = useState("idle");
+  const [providerModelDiscoveryError, setProviderModelDiscoveryError] = useState("");
+  const [applicationUpdate, setApplicationUpdate] = useState({ status: "checking", detail: "正在检查应用版本...", data: null });
+  const [showUpdateConfirm, setShowUpdateConfirm] = useState(false);
+  const [restartCountdown, setRestartCountdown] = useState(null);
+  const isOllamaProvider = ui.llmProvider === "ollama";
+  const hasApiKey = ui.hasOpenaiApiKey;
+  const draftApiKey = ui.openaiApiKey.trim();
+  const apiKeyDisplayValue = draftApiKey
+    ? (showApiKeyValue ? draftApiKey : ui.openaiApiKeyMasked || "待保存的新密钥")
+    : ui.openaiApiKeyMasked;
+  const apiKeyStatus = draftApiKey || ui.openaiApiKeyMasked;
+  const currentAsrProvider = ["faster_whisper", "whisper_cpp", "aliyun_bailian"].includes(ui.asrProvider)
+    ? ui.asrProvider
+    : "faster_whisper";
+  const asrCloudModel = ui.asrCloudModel || "paraformer-v2";
+  const asrBaseUrl = ui.asrBaseUrl || "https://dashscope.aliyuncs.com";
+  const draftAsrApiKey = (ui.asrApiKey || "").trim();
+  const asrApiKeyMasked = ui.asrApiKeyMasked || "";
+  const asrApiKeyDisplayValue = draftAsrApiKey
+    ? (showAsrApiKeyValue ? draftAsrApiKey : asrApiKeyMasked || "待保存的新密钥")
+    : asrApiKeyMasked;
+  const asrApiKeyStatus = draftAsrApiKey || asrApiKeyMasked;
+  const runtimeCapabilities = ui.runtimeCapabilities;
+  const fasterWhisperAvailable = runtimeCapabilities?.fasterWhisperAvailable !== false;
+  const gpuEmbeddingAvailable = runtimeCapabilities?.gpuEmbeddingAvailable !== false;
+  const unavailableReason = runtimeCapabilities?.unavailableReason || "当前运行环境不支持 NVIDIA CUDA 加速。";
+  const rerankerModel = ragModels.find((model) => model.key === "reranker") ?? null;
+  const rerankerNeedsDownload = rerankerModel != null && !rerankerModel.downloaded;
+  const isRerankerDownloading = (
+    rerankerModel?.status === "running" ||
+    rerankerModel?.status === "cancelling" ||
+    downloadingRagModelKey === "reranker"
+  );
+  const effectiveRerankEnabled = !rerankerNeedsDownload && ui.ragRerankEnabled;
+  const visualInputOptions = [
+    { id: "none", label: "关闭" },
+    {
+      id: "evidence",
+      label: "标准",
+      disabled: !ui.aiSummaryMultimodalEnabled,
+      disabledReason: "需先开启 AI 概括多模态以生成画面证据。",
+    },
+    {
+      id: "frames",
+      label: "精细",
+    },
+  ];
+  const providerModelOptions = [...new Set([...detectedProviderModels, ui.openaiModel].filter(Boolean))]
+    .map((model) => ({ id: model, label: model }));
+  const isProviderModelSelectActive = providerModelDiscovery === "ready";
+  const saveProviderSettingsOnEnter = (event) => {
+    if (event.key !== "Enter" || typeof onSaveProviderSettings !== "function") {
+      return;
+    }
+    event.preventDefault();
+    onSaveProviderSettings();
+  };
+  const handleProviderModelDiscovery = async () => {
+    if (isProviderModelSelectActive) {
+      setProviderModelDiscovery("idle");
+      setDetectedProviderModels([]);
+      setProviderModelDiscoveryError("");
+      return;
+    }
+    if (typeof onDiscoverProviderModels !== "function") {
+      return;
+    }
+    setProviderModelDiscovery("loading");
+    setProviderModelDiscoveryError("");
+    try {
+      const models = await onDiscoverProviderModels();
+      setDetectedProviderModels(models);
+      setProviderModelDiscovery("ready");
+    } catch (error) {
+      setProviderModelDiscovery("idle");
+      setProviderModelDiscoveryError(error instanceof Error ? error.message : "模型探测失败");
+    }
+  };
+  const providerOptions = [
+    { id: "openai", label: "openai", group: "官方", description: "OpenAI 官方 API；大多数中转站也兼容" },
+    { id: "anthropic", label: "anthropic", group: "官方", description: "Anthropic Claude 官方 API" },
+    { id: "gemini", label: "gemini", group: "官方", description: "Google Gemini 官方 API" },
+    { id: "deepseek", label: "deepseek", group: "官方", description: "DeepSeek 官方 API" },
+    { id: "xai", label: "xai", group: "官方", description: "xAI Grok 官方 API" },
+    { id: "mistral", label: "mistral", group: "官方", description: "Mistral AI 官方 API" },
+    { id: "volcengine", label: "volcengine (字节)", group: "官方", description: "火山引擎豆包官方通道" },
+    { id: "azure", label: "azure", group: "平台", description: "Azure OpenAI，微软云托管通道" },
+    { id: "vertex_ai", label: "vertex_ai", group: "平台", description: "Google Cloud Vertex AI，谷歌云托管通道" },
+    { id: "bedrock", label: "bedrock", group: "平台", description: "AWS Bedrock，亚马逊云托管模型平台" },
+    { id: "groq", label: "groq", group: "平台", description: "Groq 高速推理平台" },
+    { id: "perplexity", label: "perplexity", group: "平台", description: "Perplexity AI 搜索增强平台，支持联网搜索" },
+    { id: "openrouter", label: "openrouter", group: "平台", description: "OpenRouter 模型路由平台，支持数百个模型" },
+    { id: "ollama", label: "ollama", group: "本地", description: "本地运行，Ollama 默认接口" },
+    { id: "lm_studio", label: "lm_studio", group: "本地", description: "本地运行，LM Studio 内置服务器" },
+  ];
+
+  const checkApplicationUpdate = async () => {
+    if (typeof onCheckApplicationUpdate !== "function") {
+      return;
+    }
+    setApplicationUpdate((current) => ({ ...current, status: "checking", detail: "正在检查应用版本..." }));
+    try {
+      const data = await onCheckApplicationUpdate();
+      setApplicationUpdate({ status: data.installationKind === "source" ? "source" : data.updateAvailable ? "available" : "current", detail: data.message, data });
+    } catch (error) {
+      setApplicationUpdate({ status: "failed", detail: error instanceof Error ? error.message : "检查更新失败", data: null });
+    }
+  };
+
+  useEffect(() => {
+    void checkApplicationUpdate();
+  }, []);
+
+  useEffect(() => {
+    if (!Number.isInteger(restartCountdown) || restartCountdown <= 0) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setRestartCountdown((seconds) => seconds - 1), 1000);
+    return () => window.clearTimeout(timer);
+  }, [restartCountdown]);
+
+  const confirmApplicationUpdate = async () => {
+    if (typeof onScheduleApplicationUpdate !== "function") {
+      return;
+    }
+    setShowUpdateConfirm(false);
+    setApplicationUpdate((current) => ({ ...current, status: "applying", detail: "正在准备更新文件..." }));
+    try {
+      const result = await onScheduleApplicationUpdate();
+      setRestartCountdown(result.restartAfterSeconds);
+      setApplicationUpdate((current) => ({
+        ...current,
+        status: "completed",
+        detail: `更新文件已准备，${result.restartAfterSeconds}s 后重启应用。`,
+        data: { ...current.data, latestVersion: result.targetVersion },
+      }));
+    } catch (error) {
+      setApplicationUpdate((current) => ({ ...current, status: "failed", detail: error instanceof Error ? error.message : "更新安排失败" }));
+    }
+  };
+
+  const tabs = [
+    { id: "general", label: "常规与显示", icon: Settings2 },
+    { id: "ai", label: "AI 总结能力", icon: Cpu },
+    { id: "rag", label: "对话管理", icon: FileText },
+    { id: "keys", label: "模型供应商", icon: Key },
+    { id: "network", label: "下载管理 ", icon: Download },
+    { id: "update", label: "应用更新", icon: RefreshCw },
+  ];
+  return (
+    <motion.section
+      variants={popScaleVariant}
+      initial="initial"
+      animate="animate"
+      exit="exit"
+      className="workspace-settings-shell pointer-events-auto flex h-[84vh] w-full max-w-4xl overflow-hidden rounded-[32px] border border-line/70 bg-surface shadow-[0_28px_90px_rgba(0,0,0,0.20)]"
+      aria-label="界面设置"
+    >
+      {/* Sidebar */}
+      <div className="workspace-settings-sidebar relative z-20 flex w-[232px] shrink-0 flex-col border-r border-line/70 bg-muted/55 p-5">
+        <div className="workspace-settings-brand mb-7 mt-1 px-2">
+          <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-faint">VSUMMARY</p>
+          <h2 className="text-[26px] font-semibold tracking-[-0.03em] text-strong">设置</h2>
+        </div>
+        <div className="workspace-settings-tabs flex flex-1 flex-col gap-1">
+          {tabs.map(tab => {
+            const Icon = tab.icon;
+            const isActive = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                aria-pressed={isActive}
+                className={`workspace-settings-tab flex items-center gap-3 rounded-[13px] px-3 py-2.5 text-[13px] font-medium transition-colors ${isActive
+                  ? "bg-accent/12 text-accent"
+                  : "text-subtle hover:bg-soft hover:text-strong"
+                  }`}
+              >
+                <Icon size={16} strokeWidth={isActive ? 2.3 : 1.9} />
+                {tab.label}
+              </button>
+            )
+          })}
+        </div>
+
+        {/* Reset Settings */}
+        <div className="workspace-settings-reset mt-auto border-t border-line/70 pt-4">
+          <button
+            type="button"
+            className="workspace-settings-reset-button w-full rounded-[12px] px-3 py-2 text-left text-[13px] font-medium text-subtle transition-colors hover:bg-danger-subtle hover:text-danger"
+            onClick={() => setShowResetConfirm(true)}
+          >
+            恢复默认设置
+          </button>
+        </div>
+      </div>
+
+      {/* Main Content Area */}
+      <div className="workspace-settings-content relative flex min-w-0 flex-1 flex-col overflow-y-auto bg-canvas/35 scroll-smooth">
+        <div className="sticky top-0 z-30 flex justify-end bg-canvas/75 p-4 backdrop-blur-xl">
+          <button
+            type="button"
+            className="workspace-settings-close inline-flex h-9 w-9 items-center justify-center rounded-full bg-surface/80 text-subtle shadow-[0_1px_5px_rgba(0,0,0,0.08)] backdrop-blur-xl transition-colors hover:bg-surface hover:text-strong"
+            onClick={onClose}
+            aria-label="关闭面板"
+          >
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="max-w-3xl px-6 pb-16 md:px-9">
+          <motion.div
+            key={activeTab}
+            variants={blurVariant}
+            initial="initial"
+            animate="animate"
+            className="flex flex-col gap-5"
+          >
+            {activeTab === "general" && (
+              <>
+                <div className="mb-2">
+                  <h3 className="text-[28px] font-semibold tracking-[-0.03em] text-strong">常规与显示</h3>
+                  <p className="mt-1.5 text-[13px] text-subtle">外观、阅读和交互偏好</p>
+                </div>
+
+                {/* Theme Setting */}
+                <WorkspaceSettingRow
+                  title="深色模式"
+                  description="选择浅色、深色，或跟随系统。"
+                >
+                  <WorkspaceSegmentedControl
+                    value={ui.theme}
+                    options={[
+                      { id: "system", label: "跟随系统" },
+                      { id: "light", label: "浅色" },
+                      { id: "dark", label: "深色" },
+                    ]}
+                    onChange={(nextValue) => onChangeSetting("theme", nextValue)}
+                  />
+                </WorkspaceSettingRow>
+
+                <WorkspaceSettingRow
+                  title="显示关键收获"
+                  description="在概况内容顶部优先展示 AI 归纳的核心要点。"
+                >
+                  <WorkspaceToggleSwitch
+                    checked={ui.showTakeaways}
+                    onChange={(value) => onChangeSetting("showTakeaways", value)}
+                  />
+                </WorkspaceSettingRow>
+
+              </>
+            )}
+
+            {activeTab === "ai" && (
+              <>
+                <div className="mb-2">
+                  <h3 className="text-[28px] font-semibold tracking-[-0.03em] text-strong">AI 总结能力</h3>
+                  <p className="mt-1.5 text-[13px] text-subtle">控制总结流程与本机模型</p>
+                </div>
+
+                <WorkspaceSettingRow
+                  title="自动生成"
+                  description="AI 整理逐字稿完成后自动生成导图或知识卡片。"
+                  contentClassName="2xl:w-[340px] 2xl:flex-none"
+                >
+                  <WorkspaceMultiSelect
+                    values={ui.autoGenerateArtifacts}
+                    options={[
+                      { id: "mindmap", label: "思维导图" },
+                      { id: "knowledge_cards", label: "知识卡片" },
+                    ]}
+                    onChange={(nextValues) => onChangeSetting("autoGenerateArtifacts", nextValues)}
+                  />
+                </WorkspaceSettingRow>
+
+                <WorkspaceSettingRow
+                  title="语音识别供应商"
+                  description={
+                    !fasterWhisperAvailable && currentAsrProvider === "faster_whisper"
+                      ? `${unavailableReason} 请改用 whisper.cpp 或阿里云百炼。`
+                      : currentAsrProvider === "aliyun_bailian"
+                        ? "云端极速转写，无需依赖本地显卡或下载模型，开箱即用。"
+                        : currentAsrProvider === "whisper_cpp"
+                          ? "适用于 Mac (Metal)、AMD 显卡或纯 CPU 环境的本地引擎，跨平台兼容性好且资源占用低。"
+                          : "基于 NVIDIA 显卡 (CUDA) 的高性能本地识别，数据完全保存在本机，速度与精度兼备（首次需下载模型）。"
+                  }
+                >
+                  <WorkspaceSegmentedControl
+                    value={currentAsrProvider}
+                    options={[
+                      {
+                        id: "faster_whisper",
+                        label: "本地 faster-whisper",
+                        disabled: !fasterWhisperAvailable,
+                        disabledReason: unavailableReason,
+                      },
+                      { id: "whisper_cpp", label: "本地 whisper.cpp" },
+                      { id: "aliyun_bailian", label: "阿里云百炼" },
+                    ]}
+                    onChange={(nextValue) => onChangeSetting("asrProvider", nextValue)}
+                  />
+                </WorkspaceSettingRow>
+
+                {currentAsrProvider !== "aliyun_bailian" && (
+                  <>
+                    {currentAsrProvider === "faster_whisper" && (
+                      <WorkspaceSettingRow
+                        title="转写模式"
+                        description="平衡语音转写的解码速度与文本识别准确率。"
+                      >
+                        <WorkspaceSegmentedControl
+                          value={ui.transcriptionMode}
+                          options={[
+                            { id: "fast", label: "极速" },
+                            { id: "balanced", label: "平衡" },
+                            { id: "accurate", label: "高精度(建议)" },
+                          ]}
+                          onChange={(nextValue) => onChangeSetting("transcriptionMode", nextValue)}
+                        />
+                      </WorkspaceSettingRow>
+                    )}
+
+                    <WorkspaceSettingRow
+                      title="语音模型质量"
+                      description="选择本地识别模型规格，模型越大识别精度越高。"
+                    >
+                      <div className="w-full flex flex-col gap-3">
+                        {fasterWhisperModelsLoading && !fasterWhisperModels.length ? (
+                          <div className="flex items-center gap-2 text-sm text-subtle">
+                            <LoaderCircle size={16} className="animate-spin" />
+                            正在读取模型状态...
+                          </div>
+                        ) : (
+                          fasterWhisperModels.map((model) => {
+                            const needsConfirm = confirmDownloadModelId === model.id;
+                            const isCurrent = ui.asrModelQuality === model.id;
+                            const modelDownload = modelDownloadsById?.[model.id] ?? null;
+                            const isCancelling =
+                              modelDownload?.status === "cancelling" ||
+                              (downloadingModelId === model.id && modelDownloadStatus === "cancelling");
+                            const isDownloading =
+                              modelDownload?.status === "running" ||
+                              (downloadingModelId === model.id && modelDownloadStatus === "running");
+                            const downloadFailed =
+                              modelDownload?.status === "failed" ||
+                              (modelDownloadErrorModelId === model.id && Boolean(modelDownloadError));
+                            const downloadProgress =
+                              typeof modelDownload?.progress === "number"
+                                ? modelDownload.progress
+                                : modelDownloadProgress;
+                            const isReady = model.downloaded === true;
+                            const statusText = model.downloaded
+                              ? "已下载到本地"
+                              : isCancelling
+                                ? "正在取消下载..."
+                                : downloadFailed
+                                  ? "下载失败"
+                                  : isCurrent
+                                    ? "当前默认模型，需先下载"
+                                    : "尚未下载";
+                            return (
+                              <div
+                                key={model.id}
+                                className={`rounded-2xl border p-4 transition-colors ${downloadFailed
+                                  ? "border-danger-border bg-danger-subtle/70"
+                                  : isCurrent
+                                    ? "border-accent/30 bg-info-subtle dark:bg-info-subtle"
+                                    : "border-line"
+                                  }`}
+                              >
+                                <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                                  <div className="min-w-0">
+                                    <div className="flex items-center gap-2">
+                                      <strong className="min-w-0 break-words text-sm font-bold text-strong">{model.label}</strong>
+                                      {model.recommended ? (
+                                        <span className="rounded-full bg-accent/10 px-2 py-0.5 text-[11px] font-bold text-accent">
+                                          推荐
+                                        </span>
+                                      ) : null}
+                                    </div>
+                                    <p className="mt-1 text-xs text-subtle">
+                                      {isDownloading
+                                        ? `正在下载... ${typeof downloadProgress === "number" ? `${Math.round(downloadProgress)}%` : ""}`.trim()
+                                        : isCancelling
+                                          ? "正在取消下载..."
+                                          : statusText}
+                                    </p>
+                                    {isDownloading || isCancelling ? (
+                                      <div className="mt-3 w-full h-1.5 bg-softer/70 rounded-full overflow-hidden">
+                                        <div
+                                          className={`h-full transition-[width] duration-200 ease-out ${isCancelling ? "bg-warning" : "bg-accent"}`}
+                                          style={{ width: `${typeof downloadProgress === "number" ? downloadProgress : 8}%` }}
+                                        />
+                                      </div>
+                                    ) : null}
+                                    {downloadFailed ? (
+                                      <p className="mt-3 rounded-xl border border-danger-border bg-surface/70 px-3 py-2 text-xs font-semibold text-danger dark:bg-danger-subtle">
+                                        {MODEL_DOWNLOAD_FAILED_MESSAGE}
+                                      </p>
+                                    ) : null}
+                                  </div>
+                                  {isCancelling ? (
+                                    <button
+                                      type="button"
+                                      disabled
+                                      className="rounded-xl border border-line bg-surface px-3 py-2 text-xs font-bold text-faint disabled:cursor-wait disabled:opacity-70"
+                                    >
+                                      取消中
+                                    </button>
+                                  ) : isDownloading ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => onCancelFasterWhisperModelDownload?.(model.id)}
+                                      className="rounded-xl border border-danger-border bg-danger-subtle px-3 py-2 text-xs font-bold text-danger transition-colors hover:bg-danger/15"
+                                    >
+                                      取消下载
+                                    </button>
+                                  ) : isCurrent && isReady ? (
+                                    <button
+                                      type="button"
+                                      disabled
+                                      className="rounded-xl border border-line bg-surface px-3 py-2 text-xs font-bold text-subtle"
+                                    >
+                                      使用中
+                                    </button>
+                                  ) : isReady ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setConfirmDownloadModelId(null);
+                                        onChangeSetting("asrModelQuality", model.id);
+                                      }}
+                                      className="rounded-xl bg-accent px-3 py-2 text-xs font-bold text-on-accent hover:bg-accent/90 transition-colors"
+                                    >
+                                      使用
+                                    </button>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        if (downloadFailed || needsConfirm) {
+                                          setConfirmDownloadModelId(null);
+                                          onDownloadFasterWhisperModel(model.id);
+                                          return;
+                                        }
+                                        setConfirmDownloadModelId(model.id);
+                                      }}
+                                      className={`inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-bold transition-colors ${needsConfirm
+                                        ? "border border-warning-border text-warning hover:bg-warning/15"
+                                        : "bg-inverse text-on-inverse hover:bg-inverse/90"
+                                        }`}
+                                    >
+                                      <Download size={14} />
+                                      {downloadFailed ? "重试下载" : needsConfirm ? "确认下载?" : (isCurrent ? "下载并使用" : "下载")}
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    </WorkspaceSettingRow>
+                  </>
+                )}
+
+                {currentAsrProvider === "aliyun_bailian" && (
+                  <WorkspaceSettingRow
+                    title="阿里云百炼 ASR"
+                    description="云端转写配置。API Key 只保存到本机 .env，不写入 settings.toml。"
+                    contentClassName="2xl:flex-1"
+                  >
+                    <div className="w-full rounded-2xl border border-line bg-surface p-4">
+                      <div className="grid gap-4">
+                        <label className="grid gap-1.5">
+                          <span className="text-xs font-bold text-subtle">模型</span>
+                          <WorkspaceSelect
+                            value={asrCloudModel}
+                            options={[
+                              { id: "paraformer-v2", label: "paraformer-v2" },
+                            ]}
+                            onChange={(nextValue) => onChangeSetting("asrCloudModel", nextValue)}
+                            className="w-full"
+                          />
+                        </label>
+                        <label className="grid gap-1.5">
+                          <span className="text-xs font-bold text-subtle">API 地址</span>
+                          <WorkspaceTextInput
+                            value={asrBaseUrl}
+                            onChange={(nextValue) => onChangeSetting("asrBaseUrl", nextValue)}
+                            onBlur={() => onSaveAsrSettings?.()}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.preventDefault();
+                                onSaveAsrSettings?.();
+                              }
+                            }}
+                            placeholder="https://dashscope.aliyuncs.com"
+                            className="w-full"
+                          />
+                        </label>
+                        <label className="grid gap-1.5">
+                          <span className="text-xs font-bold text-subtle">API Key</span>
+                          <div className="flex flex-col gap-2 sm:flex-row">
+                            <WorkspaceTextInput
+                              value={asrApiKeyDisplayValue}
+                              onChange={(nextValue) => onChangeSetting("asrApiKey", nextValue)}
+                              onBlur={() => onSaveAsrSettings?.()}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter") {
+                                  event.preventDefault();
+                                  onSaveAsrSettings?.();
+                                }
+                              }}
+                              placeholder={ui.hasAsrApiKey ? "已保存" : "填写 DASHSCOPE_API_KEY"}
+                              className="w-full"
+                              type={showAsrApiKeyValue ? "text" : "password"}
+                            />
+                            <button
+                              type="button"
+                              disabled={asrApiKeyRevealLoading || !asrApiKeyStatus}
+                              onClick={async () => {
+                                if (!showAsrApiKeyValue && !draftAsrApiKey && ui.hasAsrApiKey) {
+                                  setAsrApiKeyRevealLoading(true);
+                                  const revealed = await onRevealAsrApiKey?.();
+                                  setAsrApiKeyRevealLoading(false);
+                                  if (!revealed) {
+                                    return;
+                                  }
+                                }
+                                setShowAsrApiKeyValue((value) => !value);
+                              }}
+                              className="rounded-xl border border-line px-3 py-2 text-xs font-bold text-body transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {asrApiKeyRevealLoading ? "读取中" : showAsrApiKeyValue ? "隐藏" : "显示"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => onSaveAsrSettings?.()}
+                              className="rounded-xl bg-accent px-3 py-2 text-xs font-bold text-on-accent transition-colors hover:bg-accent/90"
+                            >
+                              保存
+                            </button>
+                          </div>
+                        </label>
+                        <div>
+                          <button
+                            type="button"
+                            disabled={asrTest.status === "testing"}
+                            onClick={async () => {
+                              if (typeof onTestAsrConnection !== "function") {
+                                return;
+                              }
+                              setAsrTest({ status: "testing", message: "正在测试 ASR 连接..." });
+                              const result = await onTestAsrConnection();
+                              setAsrTest({
+                                status: result?.ok ? "success" : "failed",
+                                message: result?.message ?? "ASR 连接测试失败",
+                              });
+                            }}
+                            className="w-full rounded-xl bg-inverse px-4 py-2.5 text-xs font-bold text-on-inverse transition-colors hover:bg-inverse/90 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {asrTest.status === "testing" ? "测试中..." : "测试 ASR 连接"}
+                          </button>
+                          {asrTest.message ? (
+                            <div
+                              className={`mt-3 flex items-start gap-2 rounded-xl border px-3 py-2 text-xs font-semibold ${asrTest.status === "success"
+                                ? "border-success-border bg-success-subtle text-success"
+                                : asrTest.status === "failed"
+                                  ? "border-danger-border bg-danger-subtle text-danger"
+                                  : "border-line bg-muted text-subtle"
+                                }`}
+                            >
+                              <span className="min-w-0 flex-1">{asrTest.message}</span>
+                              <button
+                                type="button"
+                                onClick={() => setAsrTest({ status: "idle", message: "" })}
+                                className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full opacity-70 transition-colors hover:bg-surface/70 hover:opacity-100"
+                                title="关闭测试结果"
+                                aria-label="关闭测试结果"
+                              >
+                                <X size={12} />
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                    </div>
+                  </WorkspaceSettingRow>
+                )}
+
+                <WorkspaceSettingRow
+                  title="逐字稿配图"
+                  description="在逐字稿里给每章配一张画面"
+                >
+                  <WorkspaceSegmentedControl
+                    value={ui.chapterVisualMode}
+                    options={[
+                      { id: "off", label: "不生成" },
+                      { id: "screenshots", label: "生成截图" },
+                    ]}
+                    onChange={(nextValue) => onChangeSetting("chapterVisualMode", nextValue)}
+                  />
+                </WorkspaceSettingRow>
+
+                <WorkspaceSettingRow
+                  title="AI 概括配图"
+                  description="在 AI 概括正文中自动插入视频画面"
+                >
+                  <WorkspaceSegmentedControl
+                    value={ui.noteVisualMode}
+                    options={[
+                      { id: "off", label: "关闭" },
+                      { id: "screenshots", label: "自动配图" },
+                    ]}
+                    onChange={(nextValue) => onChangeSetting("noteVisualMode", nextValue)}
+                  />
+                </WorkspaceSettingRow>
+
+                <WorkspaceSettingRow
+                  title="AI 概括多模态"
+                  description="开启后增强概括质量，需要多模态模型"
+                >
+                  <WorkspaceToggleSwitch
+                    checked={ui.aiSummaryMultimodalEnabled}
+                    onChange={(value) => onChangeSetting("aiSummaryMultimodalEnabled", value)}
+                  />
+                </WorkspaceSettingRow>
+
+                <WorkspaceAdvancedSettings>
+                  {ui.aiSummaryMultimodalEnabled && (
+                    <WorkspaceSettingRow
+                      title="AI 概括多模态质量"
+                      description="默认10,调大这个数字会增大TOKEN消耗"
+                    >
+                      <WorkspaceTextInput
+                        value={String(ui.maxVisualInputImages)}
+                        onChange={(nextValue) => onChangeSetting("maxVisualInputImages", Number.parseInt(nextValue, 10) || 1)}
+                        placeholder="6"
+                        className="w-full sm:w-[180px]"
+                        type="number"
+                      />
+                    </WorkspaceSettingRow>
+                  )}
+                  <WorkspaceSettingRow
+                    title="AI 概括配图上限"
+                    description="AI 概括最多自动插入多少张画面,默认10；你在笔记里手动插入的图片不受此限制。"
+                  >
+                    <WorkspaceTextInput
+                      value={String(ui.noteMaxImages)}
+                      onChange={(nextValue) => onChangeSetting("noteMaxImages", Number.parseInt(nextValue, 10) || 1)}
+                      className="w-full sm:w-[180px]"
+                      type="number"
+                    />
+                  </WorkspaceSettingRow>
+                  <WorkspaceSettingRow
+                    title="思维导图多模态输入"
+                    description={"打开会略微提高多模态质量，'标准'依赖'ai概括多模态'但不消耗TOKEN，'精细'需要多模态模型且会消耗更多TOKEN" }
+                  >
+                    <WorkspaceSegmentedControl
+                      value={ui.mindmapVisualInput}
+                      options={visualInputOptions}
+                      onChange={(nextValue) => onChangeSetting("mindmapVisualInput", nextValue)}
+                    />
+                  </WorkspaceSettingRow>
+                  <WorkspaceSettingRow
+                    title="知识卡片多模态输入"
+                    description={ "打开会略微提高多模态质量，'标准'依赖'ai概括多模态'但不消耗TOKEN，'精细'需要多模态模型且会消耗更多TOKEN"}
+                  >
+                    <WorkspaceSegmentedControl
+                      value={ui.cardsVisualInput}
+                      options={visualInputOptions}
+                      onChange={(nextValue) => onChangeSetting("cardsVisualInput", nextValue)}
+                    />
+                  </WorkspaceSettingRow>
+                  <WorkspaceSettingRow
+                    title="视频并行处理数"
+                    description="控制全局最多同时处理多少个视频。"
+                  >
+                    <WorkspaceTextInput
+                      value={String(ui.videoGenerationConcurrency)}
+                      onChange={(nextValue) => onChangeSetting("videoGenerationConcurrency", Number.parseInt(nextValue, 10) || 1)}
+                      placeholder="1"
+                      className="w-full sm:w-[180px]"
+                      type="number"
+                    />
+                  </WorkspaceSettingRow>
+                </WorkspaceAdvancedSettings>
+
+              </>
+            )}
+
+            {activeTab === "rag" && (
+              <>
+                <div className="mb-2">
+                  <h3 className="text-[28px] font-semibold tracking-[-0.03em] text-strong">对话管理</h3>
+                  <p className="text-[13px] text-subtle mt-2">控制对话流程以及功能</p>
+                </div>
+
+                <WorkspaceSettingRow
+                  title="回复长度"
+                  description="控制回答详略"
+                >
+                  <WorkspaceSegmentedControl
+                    value={ui.answerDetailLevel}
+                    options={[
+                      { id: "short", label: "短" },
+                      { id: "medium", label: "中" },
+                      { id: "long", label: "长" },
+                    ]}
+                    onChange={(nextValue) => onChangeSetting("answerDetailLevel", nextValue)}
+                  />
+                </WorkspaceSettingRow>
+
+                <WorkspaceSettingRow
+                  title="上下文大小"
+                  description="控制模型单次可用的上下文预算。"
+                >
+                  <WorkspaceTextInput
+                    value={String(ui.windowTokens)}
+                    onChange={(nextValue) => onChangeSetting("windowTokens", Number.parseInt(nextValue, 10) || 1)}
+                    placeholder="1000000"
+                    className="w-full sm:w-[180px]"
+                    type="number"
+                  />
+                </WorkspaceSettingRow>
+
+                <WorkspaceSettingRow
+                  title="用户提示词"
+                  description="自定义修改对话输出偏好"
+                  contentClassName="2xl:flex-1"
+                >
+                  <textarea
+                    value={ui.talkCustomPrompt}
+                    onChange={(event) => onChangeSetting("talkCustomPrompt", event.target.value)}
+                    placeholder="如：回答时先给结论，再用表格对比关键概念。"
+                    rows={5}
+                    className="block w-full min-w-0 resize-y rounded-xl border border-line bg-surface px-4 py-2.5 text-sm leading-6 text-strong outline-none focus:border-accent"
+                  />
+                </WorkspaceSettingRow>
+
+                <WorkspaceAdvancedSettings>
+                  <WorkspaceSettingRow
+                    title="检索硬件引擎"
+                    description="选择向量检索的硬件计算引擎（CPU / GPU / 自动）。"
+                  >
+                    <WorkspaceSegmentedControl
+                      value={ui.ragEmbeddingDevice}
+                      options={[
+                        { id: "cpu", label: "CPU" },
+                        { id: "gpu", label: "GPU", disabled: !gpuEmbeddingAvailable, disabledReason: unavailableReason },
+                        { id: "auto", label: "自动" },
+                      ]}
+                      onChange={(nextValue) => onChangeSetting("ragEmbeddingDevice", nextValue)}
+                    />
+                  </WorkspaceSettingRow>
+
+                  <WorkspaceSettingRow
+                    title="开启 RAG 重排序模型"
+                    description={rerankerNeedsDownload ? "重排序模型尚未下载，下载前不能开启 reranking。" : "开启后将对检索到的资料进行二次精细筛选，提高回答准确度（响应时间略增）。"}
+                  >
+                    <div className="flex flex-col items-end gap-2">
+                      <WorkspaceToggleSwitch
+                        checked={effectiveRerankEnabled}
+                        disabled={rerankerNeedsDownload}
+                        onChange={(value) => onChangeSetting("ragRerankEnabled", value)}
+                      />
+                      {rerankerNeedsDownload ? (
+                        <button type="button" onClick={() => onDownloadRagModel("reranker")} disabled={isRerankerDownloading} className="inline-flex items-center gap-2 rounded-xl bg-inverse px-3 py-2 text-xs font-bold text-on-inverse transition-colors hover:bg-inverse/90 disabled:cursor-not-allowed disabled:opacity-50">
+                          <Download size={14} /> 下载重排序模型
+                        </button>
+                      ) : null}
+                    </div>
+                  </WorkspaceSettingRow>
+
+                  <WorkspaceSettingRow
+                    title="RAG 证据数量"
+                    description={effectiveRerankEnabled ? `参考资料的引用数量。将从初步检索到的 ${ui.ragMaxHits * 4} 条候选段落中，精选最相关的 ${ui.ragMaxHits} 条作为回答依据。` : `参考资料的引用数量。当前直接从检索结果中选取 ${ui.ragMaxHits} 条作为回答依据。`}
+                  >
+                    <WorkspaceTextInput value={String(ui.ragMaxHits)} onChange={(nextValue) => onChangeSetting("ragMaxHits", Number.parseInt(nextValue, 10) || 1)} placeholder="5" className="w-full sm:w-[180px]" type="number" />
+                  </WorkspaceSettingRow>
+                </WorkspaceAdvancedSettings>
+              </>
+            )}
+
+            {activeTab === "keys" && (
+              <>
+                <div className="mb-2">
+                  <h3 className="text-[28px] font-semibold tracking-[-0.03em] text-strong">模型供应商</h3>
+                </div>
+
+                <WorkspaceSettingRow
+                  title="模型协议"
+                  description="选择模型服务商对接协议（第三方中转接口通常选择 openai）。"
+                >
+                  <WorkspaceProviderSelect
+                    value={ui.llmProvider}
+                    options={providerOptions}
+                    onChange={(nextValue) => onChangeSetting("llmProvider", nextValue)}
+                    className="w-full sm:w-[280px]"
+                  />
+                </WorkspaceSettingRow>
+
+                <WorkspaceSettingRow
+                  title="API 根地址"
+                  description="自定义服务商的 API 基础 URL（留空则默认使用官方地址）。"
+                >
+                  <div className="w-full sm:w-[340px]">
+                    <WorkspaceTextInput
+                      value={ui.openaiBaseUrl}
+                      onChange={(nextValue) => onChangeSetting("openaiBaseUrl", nextValue)}
+                      onBlur={onSaveProviderSettings}
+                      onKeyDown={saveProviderSettingsOnEnter}
+                      placeholder="默认指向官方地址"
+                      className="w-full"
+                    />
+                  </div>
+                </WorkspaceSettingRow>
+
+                <WorkspaceSettingRow
+                  title="模型名称"
+                  description="可探测当前可用模型并选择，或手动填写模型ID。"
+                >
+                  <div className="flex w-full flex-col gap-2 sm:w-[340px] sm:flex-row sm:items-center">
+                    {isProviderModelSelectActive ? (
+                      <WorkspaceProviderSelect
+                        value={ui.openaiModel}
+                        options={providerModelOptions}
+                        onChange={(nextValue) => {
+                          if (typeof onSelectProviderModel === "function") {
+                            onSelectProviderModel(nextValue);
+                            return;
+                          }
+                          onChangeSetting("openaiModel", nextValue);
+                        }}
+                        className="w-full min-w-0 flex-1"
+                        hideGroupLabels
+                        ariaLabel="模型名称"
+                      />
+                    ) : (
+                      <WorkspaceTextInput
+                        value={ui.openaiModel}
+                        onChange={(nextValue) => onChangeSetting("openaiModel", nextValue)}
+                        onBlur={onSaveProviderSettings}
+                        onKeyDown={saveProviderSettingsOnEnter}
+                        placeholder="gpt-5.4"
+                        className="w-full min-w-0 flex-1"
+                      />
+                    )}
+                    <button
+                      type="button"
+                      onClick={handleProviderModelDiscovery}
+                      disabled={providerModelDiscovery === "loading" || typeof onDiscoverProviderModels !== "function"}
+                      aria-label={isProviderModelSelectActive ? "改为手动填写模型" : "探测模型"}
+                      title={isProviderModelSelectActive ? "改为手动填写模型" : "探测模型"}
+                      className="inline-flex h-10 shrink-0 items-center justify-center gap-2 rounded-xl border border-line px-3 text-xs font-bold text-body transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {providerModelDiscovery === "loading" ? (
+                        <LoaderCircle size={15} className="animate-spin" />
+                      ) : isProviderModelSelectActive ? (
+                        <Check size={16} aria-hidden="true" />
+                      ) : (
+                        "探测模型"
+                      )}
+                    </button>
+                  </div>
+                  {providerModelDiscoveryError ? (
+                    <p className="mt-2 text-xs font-semibold text-danger">{providerModelDiscoveryError}</p>
+                  ) : null}
+                </WorkspaceSettingRow>
+
+                <WorkspaceSettingRow
+                  title="思考强度"
+                  description="控制模型的思考深度"
+                >
+                  <WorkspaceSegmentedControl
+                    value={ui.reasoningEffort}
+                    options={[
+                      { id: "none", label: "无" },
+                      { id: "low", label: "低" },
+                      { id: "medium", label: "中" },
+                      { id: "high", label: "高" },
+                    ]}
+                    onChange={(nextValue) => onChangeSetting("reasoningEffort", nextValue)}
+                  />
+                </WorkspaceSettingRow>
+
+                {!isOllamaProvider ? (
+                  <WorkspaceSettingRow
+                    title="API Key"
+                    description="访问大语言模型服务所需的授权 API 密钥。"
+                    contentClassName="2xl:w-full 2xl:flex-1 2xl:shrink"
+                  >
+                    <div className="w-full min-w-0 max-w-full rounded-2xl border border-line bg-surface px-4 py-3">
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="min-w-0">
+                          <p className={`text-sm font-semibold ${hasApiKey ? "text-success" : "text-subtle"}`}>
+                            {hasApiKey ? "已配置" : "未配置"}
+                          </p>
+                          {apiKeyStatus ? (
+                            <p className="mt-1 max-w-full break-all text-xs text-subtle [overflow-wrap:anywhere]">
+                              当前状态：{apiKeyDisplayValue}
+                            </p>
+                          ) : null}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            if (showApiKeyValue) {
+                              setShowApiKeyValue(false);
+                              return;
+                            }
+                            if (!draftApiKey && typeof onRevealOpenaiApiKey === "function") {
+                              setApiKeyRevealLoading(true);
+                              const revealedKey = await onRevealOpenaiApiKey();
+                              setApiKeyRevealLoading(false);
+                              if (!revealedKey) {
+                                return;
+                              }
+                            }
+                            setShowApiKeyValue(true);
+                          }}
+                          disabled={!apiKeyStatus || apiKeyRevealLoading}
+                          className="w-full rounded-xl border border-line px-3 py-2 text-xs font-bold text-subtle transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
+                        >
+                          {apiKeyRevealLoading ? "读取中..." : showApiKeyValue ? "隐藏" : "显示"}
+                        </button>
+                      </div>
+                      {showApiKeyValue ? (
+                        <textarea
+                          value={ui.openaiApiKey}
+                          onChange={(event) => onChangeSetting("openaiApiKey", event.target.value)}
+                          placeholder={hasApiKey ? "输入新 Key 以覆盖现有配置" : "sk-..."}
+                          rows={3}
+                          className="mt-3 block w-full min-w-0 max-w-full resize-none overflow-y-auto break-all rounded-xl border border-line bg-surface px-4 py-2.5 font-mono text-sm leading-6 text-strong outline-none [overflow-wrap:anywhere] focus:border-accent"
+                        />
+                      ) : (
+                        <WorkspaceTextInput
+                          type="password"
+                          value={ui.openaiApiKey}
+                          onChange={(nextValue) => onChangeSetting("openaiApiKey", nextValue)}
+                          placeholder={hasApiKey ? "输入新 Key 以覆盖现有配置" : "sk-..."}
+                          className="mt-3 w-full min-w-0 dark:bg-sunken"
+                        />
+                      )}
+                      <div className="mt-3 flex justify-end">
+                        <button
+                          type="button"
+                          onClick={onSaveApiKey}
+                          disabled={!ui.openaiApiKey.trim()}
+                          className="w-full rounded-xl bg-inverse px-4 py-2 text-xs font-bold text-on-inverse transition-colors hover:bg-inverse/90 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
+                        >
+                          保存 Key
+                        </button>
+                      </div>
+                    </div>
+                  </WorkspaceSettingRow>
+                ) : null}
+
+                <WorkspaceSettingRow
+                  title="连接测试"
+                  description="发起一次模型请求"
+                >
+                  <div className="w-full sm:w-[340px]">
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (typeof onTestProviderConnection !== "function") {
+                          return;
+                        }
+                        setProviderTest({ status: "testing", message: "正在测试模型连接..." });
+                        const result = await onTestProviderConnection();
+                        setProviderTest({
+                          status: result?.ok ? "success" : "failed",
+                          message: result?.message ?? "模型连接测试失败",
+                        });
+                      }}
+                      disabled={providerTest.status === "testing"}
+                      className="w-full rounded-xl bg-accent px-4 py-2.5 text-xs font-bold text-on-accent transition-colors hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {providerTest.status === "testing" ? "测试中..." : "测试"}
+                    </button>
+                    {providerTest.message ? (
+                      <div
+                        className={`mt-3 flex items-start gap-2 rounded-xl border px-3 py-2 text-xs font-semibold ${providerTest.status === "success"
+                          ? "border-success-border bg-success-subtle text-success"
+                          : providerTest.status === "failed"
+                            ? "border-danger-border bg-danger-subtle text-danger"
+                            : "border-line bg-muted text-subtle"
+                          }`}
+                      >
+                        <span className="min-w-0 flex-1">{providerTest.message}</span>
+                        <button
+                          type="button"
+                          onClick={() => setProviderTest({ status: "idle", message: "" })}
+                          className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full opacity-70 transition-colors hover:bg-surface/70 hover:opacity-100"
+                          title="关闭测试结果"
+                          aria-label="关闭测试结果"
+                        >
+                          <X size={12} />
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                </WorkspaceSettingRow>
+
+                <WorkspaceSettingRow
+                  title="联网搜索"
+                  description="开启后，Agent 仅在本地内容缺失或你明确要求联网时才会使用联网搜索。需要当前模型或供应商支持联网搜索。"
+                >
+                  <WorkspaceToggleSwitch
+                    checked={ui.webSearchEnabled}
+                    onChange={(value) => onChangeSetting("webSearchEnabled", value)}
+                  />
+                </WorkspaceSettingRow>
+
+                <WorkspaceSettingRow
+                  title="API 用量统计"
+                  description="查看真实 token 用量、供应商与模型分布。"
+                >
+                  <button
+                    type="button"
+                    onClick={onOpenUsagePage}
+                    className="px-4 py-2.5 rounded-xl text-sm font-bold bg-accent text-on-accent shadow-sm hover:bg-accent-hover transition-colors"
+                  >
+                    打开用量统计
+                  </button>
+                </WorkspaceSettingRow>
+              </>
+            )}
+
+            {activeTab === "network" && (
+              <>
+                <div className="mb-2">
+                  <h3 className="text-[28px] font-semibold tracking-[-0.03em] text-strong">下载管理</h3>
+                  <p className="text-[13px] text-subtle mt-2">
+                    管理内容下载
+                  </p>
+                </div>
+
+                <WorkspaceSettingRow
+                  title="HuggingFace 镜像地址"
+                  description="模型下载镜像地址。留空后保存将使用 HuggingFace 官方源。"
+                >
+                  <WorkspaceTextInput
+                    value={ui.hfEndpoint}
+                    onChange={(nextValue) => onChangeSetting("hfEndpoint", nextValue)}
+                    onBlur={onSaveProviderSettings}
+                    onKeyDown={saveProviderSettingsOnEnter}
+                    placeholder="https://huggingface.co"
+                    className="w-full sm:w-[340px]"
+                  />
+                </WorkspaceSettingRow>
+
+                <WorkspaceSettingRow
+                  title="RAG 检索模型"
+                  description="Series 对话需要embdding模型，reranking模型强化检索能力(可选)"
+                >
+                  <div className="w-full flex flex-col gap-3">
+                    {ragModelsError ? (
+                      <p role="alert" className="rounded-xl border border-danger-border bg-danger-subtle px-3 py-2 text-xs font-semibold text-danger">
+                        {ragModelsError}
+                      </p>
+                    ) : null}
+                    {ragModelsLoading && !ragModels.length ? (
+                      <div className="flex items-center gap-2 text-sm text-subtle">
+                        <LoaderCircle size={16} className="animate-spin" />
+                        正在读取 RAG 模型状态...
+                      </div>
+                    ) : (
+                      ragModels.map((model) => {
+                        const isCancelling = model.status === "cancelling";
+                        const isDownloading = !isCancelling && (
+                          model.status === "running" || downloadingRagModelKey === model.key
+                        );
+                        const downloadFailed = model.status === "failed" && Boolean(model.error);
+                        const statusText = model.downloaded
+                          ? "已下载到本地"
+                          : isCancelling
+                            ? "正在取消下载..."
+                            : isDownloading
+                            ? `正在下载 RAG 模型... ${typeof model.progress === "number" ? `${Math.round(model.progress)}%` : ""}`.trim()
+                            : downloadFailed
+                              ? "下载失败"
+                              : "尚未下载";
+                        return (
+                          <div
+                            key={model.key}
+                            className={`rounded-2xl border p-4 transition-colors ${downloadFailed
+                              ? "border-danger-border bg-danger-subtle/70"
+                              : model.downloaded
+                                ? "border-accent/30 bg-info-subtle dark:bg-info-subtle"
+                                : "border-line"
+                              }`}
+                          >
+                            <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                              <div className="min-w-0">
+                                <strong className="break-words text-sm font-bold text-strong">{model.label}</strong>
+                                <p className="mt-1 text-xs text-subtle">{statusText}</p>
+                                {isDownloading || isCancelling ? (
+                                  <div className="mt-3 w-full h-1.5 bg-softer/70 rounded-full overflow-hidden">
+                                    <div
+                                      className="h-full bg-accent transition-[width] duration-200 ease-out"
+                                      style={{ width: `${typeof model.progress === "number" ? model.progress : 8}%` }}
+                                    />
+                                  </div>
+                                ) : null}
+                                {downloadFailed ? (
+                                  <p className="mt-3 rounded-xl border border-danger-border bg-surface/70 px-3 py-2 text-xs font-semibold text-danger dark:bg-danger-subtle">
+                                    {model.error || MODEL_DOWNLOAD_FAILED_MESSAGE}
+                                  </p>
+                                ) : null}
+                              </div>
+                              {isCancelling ? (
+                                <button
+                                  type="button"
+                                  disabled
+                                  className="rounded-xl border border-line bg-surface px-3 py-2 text-xs font-bold text-faint disabled:cursor-wait disabled:opacity-70"
+                                >
+                                  取消中
+                                </button>
+                              ) : isDownloading ? (
+                                <button
+                                  type="button"
+                                  onClick={() => onCancelRagModelDownload?.(model.key)}
+                                  className="rounded-xl border border-danger-border bg-danger-subtle px-3 py-2 text-xs font-bold text-danger transition-colors hover:bg-danger/15"
+                                >
+                                  取消下载
+                                </button>
+                              ) : model.downloaded ? (
+                                <button
+                                  type="button"
+                                  disabled
+                                  className="rounded-xl border border-line bg-surface px-3 py-2 text-xs font-bold text-subtle"
+                                >
+                                  使用中
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => onDownloadRagModel(model.key)}
+                                  disabled={isDownloading}
+                                  className="inline-flex items-center gap-2 rounded-xl bg-inverse px-3 py-2 text-xs font-bold text-on-inverse transition-colors hover:bg-inverse/90 disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                  <Download size={14} />
+                                  {downloadFailed ? "重试下载" : "下载"}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </WorkspaceSettingRow>
+              </>
+            )}
+
+            {activeTab === "update" && (
+              <>
+                <div className="mb-2">
+                  <h3 className="text-[28px] font-semibold tracking-[-0.03em] text-strong">应用更新</h3>
+                  <p className="mt-2 text-[13px] text-subtle">安装版支持增量更新与事务回滚。</p>
+                </div>
+                <WorkspaceSettingRow title="当前版本" description={applicationUpdate.status === "available" ? "可通过增量更新" : applicationUpdate.detail}>
+                  <span className={`inline-flex rounded-lg border px-3 py-2 text-sm font-bold ${applicationUpdate.status === "available" ? "border-accent/30 bg-accent/10 text-accent dark:border-accent/40 dark:bg-accent/15" : applicationUpdate.status === "completed" ? "border-success/30 bg-success/10 text-success" : "border-line bg-soft text-subtle"}`}>
+                    {applicationUpdate.data?.currentVersion ?? "v.Source"}
+                    {applicationUpdate.status !== "source" && applicationUpdate.data?.variant ? ` · ${applicationUpdate.data.variant.toUpperCase()}` : ""}
+                  </span>
+                </WorkspaceSettingRow>
+
+                {applicationUpdate.status === "source" ? null : (
+                  <WorkspaceSettingRow title="检查更新" description={applicationUpdate.data?.latestVersion ? `最新版本：${applicationUpdate.data.latestVersion}` : "检查最新发布版本。"}>
+                    <button
+                      type="button"
+                      onClick={() => void checkApplicationUpdate()}
+                      disabled={applicationUpdate.status === "checking" || applicationUpdate.status === "applying" || applicationUpdate.status === "completed"}
+                      className="inline-flex items-center gap-2 rounded-lg border border-line-strong bg-surface px-4 py-2.5 text-sm font-bold text-body transition-colors hover:border-accent/50 hover:text-accent disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {applicationUpdate.status === "checking" ? <LoaderCircle size={16} className="animate-spin" /> : <RefreshCw size={16} />}
+                      检查更新
+                    </button>
+                  </WorkspaceSettingRow>
+                )}
+
+                {applicationUpdate.status === "available" && applicationUpdate.data?.canApply ? (
+                  <WorkspaceSettingRow title={`发现 ${applicationUpdate.data.latestVersion}`} description="可通过增量更新。">
+                    <button type="button" onClick={() => setShowUpdateConfirm(true)} className="inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2.5 text-sm font-bold text-on-accent transition-colors hover:bg-accent/90">
+                      <Download size={16} /> 更新
+                    </button>
+                  </WorkspaceSettingRow>
+                ) : null}
+
+                {applicationUpdate.status === "available" && applicationUpdate.data?.requiresFullPackage ? (
+                  <WorkspaceSettingRow title="需要完整安装包" description={applicationUpdate.detail}>
+                    {applicationUpdate.data.fullPackageUrl ? (
+                      <a href={applicationUpdate.data.fullPackageUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2.5 text-sm font-bold text-on-accent transition-colors hover:bg-accent/90"><Download size={16} /> 下载完整包</a>
+                    ) : null}
+                  </WorkspaceSettingRow>
+                ) : null}
+
+                {applicationUpdate.status === "applying" ? (
+                  <WorkspaceSettingRow title="正在准备更新" description="正在下载并校验更新文件，完成后会自动开始重启倒计时。">
+                    <span className="inline-flex items-center gap-2 rounded-lg border border-accent/30 bg-accent/10 px-4 py-2.5 text-sm font-bold text-accent dark:border-accent/40 dark:bg-accent/15">
+                      <LoaderCircle size={16} className="animate-spin" /> 正在准备
+                    </span>
+                  </WorkspaceSettingRow>
+                ) : null}
+
+                {applicationUpdate.status === "completed" ? (
+                  <WorkspaceSettingRow title="更新准备完成" description={restartCountdown != null && restartCountdown > 0 ? `${restartCountdown}s 后自动重启应用。` : "正在重启应用..."}>
+                    <span className="inline-flex items-center gap-2 rounded-lg border border-success/30 bg-success/10 px-4 py-2.5 text-sm font-bold text-success"><Check size={16} /> 已安排重启</span>
+                  </WorkspaceSettingRow>
+                ) : null}
+                <WorkspaceLegacyMigrationPanel
+                  onSelectSource={onSelectLegacyMigrationSource}
+                  onInspect={onInspectLegacyMigration}
+                  onCreateRun={onCreateLegacyMigrationRun}
+                  onStartRun={onStartLegacyMigrationRun}
+                  onLoadRun={onLoadLegacyMigrationRun}
+                  onLoadLatestRun={onLoadLatestLegacyMigrationRun}
+                  onCancelRun={onCancelLegacyMigrationRun}
+                />
+              </>
+            )}
+
+          </motion.div>
+        </div>
+      </div>
+
+      {/* Reset Confirmation Overlay */}
+      <AnimatePresence>
+        {showResetConfirm && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="absolute inset-0 z-[100] bg-surface/60 backdrop-blur-sm flex items-center justify-center p-6"
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 10 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 10 }}
+              className="bg-surface border border-line p-7 rounded-[1.5rem] shadow-[0_20px_40px_rgba(0,0,0,0.15)] max-w-[340px] w-full text-center"
+            >
+              <h3 className="text-xl font-bold text-strong mb-2">恢复默认设置？</h3>
+              <p className="text-[13px] leading-relaxed text-subtle mb-6">
+                此操作将恢复工作区默认设置，并立即覆盖真实的 <code className="bg-soft px-1 py-0.5 rounded text-body">settings.toml</code>。`.env` 中的模型供应商配置不会被改动。确定继续？
+              </p>
+              <div className="flex gap-3 justify-center w-full">
+                <button
+                  type="button"
+                  onClick={() => setShowResetConfirm(false)}
+                  className="flex-1 py-2.5 rounded-xl text-[13px] font-bold text-subtle bg-soft hover:bg-softer transition-colors"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onResetSettings();
+                    setShowResetConfirm(false);
+                  }}
+                  className="flex-1 py-2.5 rounded-xl text-[13px] font-bold btn-danger shadow-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  确认恢复
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {showUpdateConfirm && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 z-[100] flex items-center justify-center bg-surface/60 p-6 backdrop-blur-sm">
+            <motion.div initial={{ scale: 0.95, y: 10 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.95, y: 10 }} className="w-full max-w-[360px] rounded-[1.5rem] border border-line bg-surface p-7 text-center shadow-[0_20px_40px_rgba(0,0,0,0.15)]">
+              <h3 className="mb-2 text-xl font-bold text-strong">确认更新？</h3>
+              <p className="mb-6 text-[13px] leading-relaxed text-subtle">请确保没有正在处理的任务再更新。系统会先准备更新文件，完成后开始短倒计时并自动重启。</p>
+              <div className="flex w-full justify-center gap-3">
+                <button type="button" onClick={() => setShowUpdateConfirm(false)} className="flex-1 rounded-xl bg-soft py-2.5 text-[13px] font-bold text-subtle transition-colors hover:bg-softer">取消</button>
+                <button type="button" onClick={() => void confirmApplicationUpdate()} className="flex-1 rounded-xl bg-accent py-2.5 text-[13px] font-bold text-on-accent shadow-sm transition-colors hover:bg-accent/90">确认更新</button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.section>
+  );
+}

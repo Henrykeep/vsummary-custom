@@ -1,0 +1,121 @@
+"""yt-dlp 平台共享的 Cookie 文件工具。"""
+
+from __future__ import annotations
+
+import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import TypeVar
+from backend.shared.request_pacing import RequestPacer
+
+
+T = TypeVar("T")
+
+
+def request_sleep_flags(pacer: RequestPacer | None) -> list[str]:
+    if pacer is None:
+        return []
+    delay = str(pacer.interval_seconds)
+    return ["--sleep-requests", delay, "--sleep-interval", delay]
+
+
+def capped_format_selector(max_height: int) -> str:
+    """Best stream no taller than ``max_height``, falling back to the smallest one.
+
+    ``<=?`` keeps formats whose height is unknown (common on Douyin) eligible.
+    """
+    if max_height <= 0:
+        raise ValueError("max_height must be positive.")
+    return f"bv*[height<=?{max_height}]+ba/b[height<=?{max_height}]/wv*+ba/w"
+
+
+class CookieRequiredError(RuntimeError):
+    """An extractor explicitly reported that authentication is required."""
+
+
+class RiskControlError(CookieRequiredError):
+    """A provider's WAF/risk-control response that a configured cookie may bypass."""
+
+    status_code = 412
+    retryable = True
+    retry_after_seconds = 30
+
+
+def is_risk_control(error: Exception) -> bool:
+    """Return whether an extractor error looks like a Bilibili-style WAF rejection."""
+    if isinstance(error, RiskControlError):
+        return True
+    message = str(error).lower()
+    return "http error 412" in message or "412: precondition failed" in message or "precondition failed" in message
+
+
+def requires_cookie(error: Exception) -> bool:
+    if isinstance(error, CookieRequiredError) or is_risk_control(error):
+        return True
+    message = str(error).lower()
+    # yt-dlp CLI exposes extractor errors as text, not structured error codes.
+    return any(marker in message for marker in (
+        "login required", "log in to", "please log in", "sign in to", "not logged in",
+        "only available when logged in", "fresh cookies", "cookies are needed",
+        "cookies are no longer valid", "cookie_required", "for the authentication",
+        "only available for registered users", "http error 401", "401 unauthorized",
+    ))
+
+
+def is_format_unavailable(error: Exception) -> bool:
+    message = str(error).lower()
+    return "requested format is not available" in message or "no video formats" in message
+
+
+def run_with_cookie_fallback(operation: Callable[[str], T], cookie: str) -> T:
+    """Try anonymously, then retry an explicit authentication failure once."""
+    try:
+        return operation("")
+    except InterruptedError:
+        raise
+    except Exception as error:
+        if not cookie.strip() or not requires_cookie(error):
+            raise
+    return operation(cookie)
+
+
+@contextmanager
+def temporary_cookie_file(cookie: str, domain: str) -> Iterator[Path | None]:
+    path = write_cookies_file(cookie, domain)
+    if cookie.strip() and path is None:
+        raise ValueError("Configured Cookie contains no cookie pairs.")
+    try:
+        yield path
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
+def parse_cookie_pairs(cookie: str) -> list[tuple[str, str]]:
+    """解析 HTTP Cookie header，保留有名称的键值对。"""
+    pairs: list[tuple[str, str]] = []
+    for part in cookie.split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        normalized_name = name.strip()
+        if normalized_name:
+            pairs.append((normalized_name, value.strip()))
+    return pairs
+
+
+def write_cookies_file(cookie: str, domain: str) -> Path | None:
+    """将 Cookie header 写为 yt-dlp 可读取的 Netscape 文件。"""
+    pairs = parse_cookie_pairs(cookie)
+    if not pairs:
+        return None
+    normalized_domain = domain.strip().lstrip(".")
+    if not normalized_domain:
+        raise ValueError("cookie domain must not be blank")
+    handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".cookies.txt")
+    with handle:
+        handle.write("# Netscape HTTP Cookie File\n")
+        for name, value in pairs:
+            handle.write(f".{normalized_domain}\tTRUE\t/\tTRUE\t0\t{name}\t{value}\n")
+    return Path(handle.name)

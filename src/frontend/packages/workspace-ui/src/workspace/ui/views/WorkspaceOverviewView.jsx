@@ -1,0 +1,108 @@
+import { useState } from "react";
+import { LoaderCircle, Pencil } from "lucide-react";
+
+import { WorkspaceStateBlock } from "../shared/WorkspaceStateBlock";
+import { WorkspaceContentEditorModal } from "./WorkspaceContentEditorModal";
+import { WorkspaceOverviewContent } from "./WorkspaceOverviewContent";
+
+export function WorkspaceOverviewView({
+  ui,
+  tools,
+  summary,
+  playbackTime,
+  followOverviewPlayback,
+  onFollowOverviewPlaybackChange,
+  selectedVideo,
+  selectedChapterId,
+  citationFocus,
+  summaryLoading,
+  canEdit = true,
+  isGeneratingSelectedVideo,
+  onSeek,
+  onLoadTranscriptMarkdown,
+  onLoadSummaryMarkdown,
+  onUpdateSummary,
+  onUpdateTranscript,
+  onOpenAiSummary,
+}) {
+  const [editorOpen, setEditorOpen] = useState(false);
+  const hasSummary = Boolean(summary);
+  const overviewTitle = summary?.title ?? selectedVideo?.title ?? "AI 整理逐字稿";
+
+  if (!selectedVideo) {
+    return (
+      <WorkspaceStateBlock
+        title="等待视频"
+        description="在左侧选一个视频，这里会显示它的逐字稿。"
+        dashed
+      />
+    );
+  }
+
+  if (!tools?.overview.generated) {
+    return (
+      <WorkspaceStateBlock
+        title={overviewTitle}
+        description="逐字稿会在生成 AI 概括时一起整理好，带章节和时间点。"
+        actionLabel="前往 AI 概括"
+        onAction={onOpenAiSummary}
+      >
+        {isGeneratingSelectedVideo ? (
+          <div className="motion-fade-up mt-6 w-full max-w-xl">
+            <div className="motion-busy-button inline-flex items-center gap-2 rounded-full border border-line bg-surface px-4 py-2 text-sm text-subtle shadow-sm">
+              <LoaderCircle size={16} strokeWidth={2.2} className="animate-spin text-accent" />
+              正在整理逐字稿...
+            </div>
+            <div className="workspace-elevated-panel mt-6 rounded-3xl border p-6">
+              <div className="motion-shimmer h-3 w-24 rounded-full bg-soft"></div>
+              <div className="motion-shimmer mt-5 h-7 w-3/4 rounded-2xl bg-soft"></div>
+              <div className="motion-shimmer mt-4 h-4 w-full rounded-full bg-soft"></div>
+              <div className="motion-shimmer mt-3 h-4 w-5/6 rounded-full bg-soft"></div>
+              <div className="motion-shimmer mt-8 h-24 w-full rounded-2xl bg-soft"></div>
+            </div>
+          </div>
+        ) : null}
+      </WorkspaceStateBlock>
+    );
+  }
+
+  if (summaryLoading) {
+    return (
+      <WorkspaceStateBlock
+        title={overviewTitle}
+        description="正在读取已生成的整理逐字稿。"
+        loading
+      />
+    );
+  }
+
+  if (!hasSummary) {
+    return null;
+  }
+
+  return (
+    <div className="flex w-full flex-col gap-8 pb-32">
+      {isGeneratingSelectedVideo ? (
+        <div className="flex items-center gap-2 rounded-lg border border-accent/25 bg-accent/5 px-3 py-2 text-sm text-body">
+          <LoaderCircle size={16} className="animate-spin text-accent" />
+          正在整理逐字稿，当前仍显示上一次结果。
+        </div>
+      ) : null}
+      {canEdit ? <div className="flex flex-wrap justify-end gap-2">
+        <button type="button" onClick={() => setEditorOpen(true)} className="inline-flex items-center gap-2 rounded-lg border border-line bg-surface px-3 py-2 text-sm font-semibold text-body shadow-sm transition-colors hover:bg-soft"><Pencil size={16} />编辑内容</button>
+      </div> : null}
+      <WorkspaceOverviewContent
+        key={selectedVideo.id}
+        ui={ui}
+        summary={summary}
+        playbackTime={playbackTime}
+        followOverviewPlayback={followOverviewPlayback}
+        onFollowOverviewPlaybackChange={onFollowOverviewPlaybackChange}
+        selectedChapterId={selectedChapterId}
+        citationFocus={citationFocus}
+        onSeek={onSeek}
+      />
+      {canEdit && editorOpen ? <WorkspaceContentEditorModal onClose={() => setEditorOpen(false)} onLoadSummaryMarkdown={onLoadSummaryMarkdown} onLoadTranscriptMarkdown={onLoadTranscriptMarkdown} onUpdateSummary={onUpdateSummary} onUpdateTranscript={onUpdateTranscript} /> : null}
+    </div>
+  );
+}

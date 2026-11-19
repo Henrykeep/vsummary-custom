@@ -1,0 +1,57 @@
+{
+  "name": "video-include-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "test": "vitest run",
+    "build": "npm run build:workspace-ui && vite build",
+    "build:workspace-ui": "npm --prefix packages/workspace-ui run build",
+    "verify:workspace-ui-boundary": "node scripts/verify-workspace-ui-boundary.mjs",
+    "audit:references": "knip --config knip.json",
+    "preview": "vite preview",
+    "test:e2e": "playwright test",
+    "test:e2e:real-browser": "node ../../tools/real_llm_browser_e2e.mjs"
+  },
+  "dependencies": {
+    "@alpha03123/vsummary-workspace-ui": "0.5.0-alpha.28",
+    "@tanstack/react-virtual": "^3.14.10",
+    "chart.js": "^4.5.1",
+    "d3": "^7.9.0",
+    "framer-motion": "^12.38.0",
+    "katex": "^0.17.0",
+    "lucide-react": "^1.7.0",
+    "markmap-view": "^0.18.12",
+    "mdast-util-to-string": "^4.0.0",
+    "react": "^19.2.0",
+    "react-chartjs-2": "^5.3.1",
+    "react-dom": "^19.2.0",
+    "react-markdown": "^10.1.0",
+    "react-mosaic-component": "^7.1.0",
+    "rehype-katex": "^7.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
+    "remark-parse": "^11.0.0",
+    "unified": "^11.0.5"
+  },
+  "devDependencies": {
+    "@babel/parser": "^7.29.9",
+    "@playwright/test": "^1.61.0",
+    "@tailwindcss/container-queries": "^0.1.1",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@vitejs/plugin-react": "^5.1.0",
+    "autoprefixer": "^10.4.27",
+    "jsdom": "^29.0.1",
+    "knip": "^6.37.0",
+    "postcss": "^8.5.8",
+    "postcss-import": "^17.0.0",
+    "tailwindcss": "^3.4.19",
+    "vite": "^7.1.12",
+    "vitest": "^4.1.2"
+  },
+  "workspaces": [
+    "packages/workspace-ui"
+  ]
+}

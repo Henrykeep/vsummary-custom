@@ -1,0 +1,130 @@
+import { useState, useRef } from "react";
+import { AnimatePresence, motion } from "framer-motion";
+import { ChevronDown, ChevronUp, LoaderCircle, Network, Download, RefreshCw } from "lucide-react";
+
+import { MINDMAP_DEPTH_OPTIONS } from "../../model/mindmapDepthOptions";
+import { MindmapCanvas } from "../MindmapCanvas";
+import { WorkspaceProviderSelect } from "../shared/WorkspaceSettingsControls";
+import { WorkspaceStateBlock } from "../shared/WorkspaceStateBlock";
+import { WorkspaceGenerationStatus } from "../shared/WorkspaceGenerationStatus";
+import { exportMindmapAsSVG } from "../mindmapSVGExport";
+
+export function WorkspaceSeriesMindmapView({
+  seriesId,
+  seriesMindmap,
+  seriesMindmapAvailable,
+  seriesMindmapLoading,
+  generatingSeriesMindmap,
+  selectedNode,
+  onFocusNode,
+  onGenerateSeriesMindmap,
+  mindmapGenerationProgress,
+  theme,
+}) {
+  const [maxDepth, setMaxDepth] = useState(null);
+  const [controlsOpen, setControlsOpen] = useState(false);
+  const markmapRef = useRef(null);
+
+
+  if (seriesMindmapLoading) {
+    return (
+      <WorkspaceStateBlock
+        title="载入思维导图"
+        description="正在读取已生成的导图。"
+        loading
+      />
+    );
+  }
+
+  if (!seriesMindmapAvailable) {
+    return (
+      <WorkspaceStateBlock
+        title="需要先生成 AI 概括"
+        description="系列导图要用到每个视频的 AI 概括，先把它们生成出来。"
+      />
+    );
+  }
+
+  if (!seriesMindmap) {
+    return (
+      <WorkspaceStateBlock
+        title="导图未生成"
+        description="根据系列里所有视频的 AI 概括，画一张总的导图。"
+      >
+        <div className="flex flex-wrap items-center justify-center gap-3">
+          <label className="inline-flex items-center gap-2 text-sm font-medium text-subtle">
+            层级
+            <WorkspaceProviderSelect
+              ariaLabel="导图层级"
+              value={maxDepth === null ? "auto" : String(maxDepth)}
+              onChange={(value) => setMaxDepth(value === "auto" ? null : Number(value))}
+              options={MINDMAP_DEPTH_OPTIONS}
+              disabled={generatingSeriesMindmap}
+              hideGroupLabels
+              className="w-24"
+            />
+          </label>
+          <button
+            type="button"
+            onClick={() => onGenerateSeriesMindmap(maxDepth)}
+            disabled={generatingSeriesMindmap}
+            className={`inline-flex items-center gap-2 rounded-2xl px-5 py-3 text-sm font-semibold transition-all ${
+              generatingSeriesMindmap
+                ? "motion-busy-button cursor-not-allowed bg-softer text-subtle"
+                : "bg-accent text-on-accent shadow-sm hover:bg-accent/90"
+            }`}
+          >
+            {generatingSeriesMindmap ? (
+              <>
+                <LoaderCircle size={16} strokeWidth={2.2} className="animate-spin" />
+                正在生成
+              </>
+            ) : (
+              <>
+                <Network size={16} strokeWidth={2.2} />
+                生成系列导图
+              </>
+            )}
+          </button>
+        </div>
+        {generatingSeriesMindmap ? (
+          <WorkspaceGenerationStatus snapshot={mindmapGenerationProgress} label="正在生成系列思维导图" />
+        ) : null}
+      </WorkspaceStateBlock>
+    );
+  }
+
+  const actionBar = (
+    <AnimatePresence initial={false} mode="wait">
+      {controlsOpen ? (
+    <motion.div key="controls" initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.18, ease: "easeOut" }} className="workspace-elevated-panel absolute left-1/2 top-3 z-10 flex -translate-x-1/2 items-center gap-1 rounded-xl p-1.5 shadow-lg">
+      <div className="flex items-center gap-1">
+        <label className="inline-flex">
+          <span className="sr-only">导图层级</span>
+          <WorkspaceProviderSelect ariaLabel="导图层级" value={maxDepth === null ? "auto" : String(maxDepth)} onChange={(value) => setMaxDepth(value === "auto" ? null : Number(value))} options={MINDMAP_DEPTH_OPTIONS} disabled={generatingSeriesMindmap} hideGroupLabels className="w-24" />
+        </label>
+        <button type="button" onClick={() => onGenerateSeriesMindmap(maxDepth)} disabled={generatingSeriesMindmap} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-accent/10 hover:text-accent disabled:cursor-not-allowed disabled:opacity-40" title={generatingSeriesMindmap ? "正在重新生成全局思维导图" : "重新生成全局思维导图"} aria-label={generatingSeriesMindmap ? "正在重新生成全局思维导图" : "重新生成全局思维导图"}>
+          <RefreshCw size={14} strokeWidth={2} className={generatingSeriesMindmap ? "animate-spin" : ""} />
+        </button>
+        <button type="button" className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-accent/10 hover:text-accent" onClick={() => markmapRef.current && exportMindmapAsSVG(markmapRef.current, `series-mindmap-${seriesId}.svg`)} title="导出 SVG" aria-label="导出 SVG"><Download size={14} strokeWidth={2} /></button>
+        <button type="button" onClick={() => setControlsOpen(false)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-faint transition-colors hover:bg-accent/10 hover:text-accent" title="收起导图工具" aria-label="收起导图工具" aria-expanded="true">
+          <ChevronUp size={16} />
+        </button>
+      </div>
+    </motion.div>
+      ) : (
+    <motion.button key="toggle" type="button" initial={{ opacity: 0, y: -6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} transition={{ duration: 0.16, ease: "easeOut" }} onClick={() => setControlsOpen(true)} className="absolute left-1/2 top-1 z-10 inline-flex h-6 w-8 -translate-x-1/2 items-center justify-center text-faint transition-colors hover:text-accent" title="展开导图工具" aria-label="展开导图工具" aria-expanded="false">
+      <ChevronDown size={16} />
+    </motion.button>
+      )}
+    </AnimatePresence>
+  );
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="relative min-h-0 flex-1 w-full overflow-hidden">
+        <MindmapCanvas root={seriesMindmap} selectedNodeId={selectedNode?.id ?? null} onSelectNode={onFocusNode} markmapRef={markmapRef} theme={theme} />
+        {actionBar}
+      </div>
+    </div>
+  );
+}

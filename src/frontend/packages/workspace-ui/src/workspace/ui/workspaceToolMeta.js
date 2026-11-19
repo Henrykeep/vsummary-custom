@@ -1,0 +1,163 @@
+import {
+  BrainCircuit,
+  FileText,
+  FolderKanban,
+  ListChecks,
+  Network,
+  PlaySquare,
+  StickyNote,
+  MessageSquare,
+} from "lucide-react";
+
+/**
+ * Shared visual styling for every tool tile.
+ *
+ * Previously each of the 8 tiles repeated the same `palette` / `iconShell` /
+ * `arrowShell` strings verbatim (~1.4 KB of duplication). They are now sourced
+ * from a single object so the look-and-feel of tool tiles can be tuned in one
+ * place. Tile entries only declare their semantic identity (label/description/icon).
+ */
+const SHARED_TOOL_VISUALS = {
+  palette:
+    "border border-line/70 bg-surface shadow-[0_0_0_0.5px_rgba(0,0,0,0.025),0_2px_10px_rgba(0,0,0,0.025)] hover:border-line-strong/70 hover:bg-muted/30 transition-colors",
+  iconShell: "bg-accent/10 text-accent",
+  arrowShell:
+    "bg-soft text-accent group-hover:bg-accent group-hover:text-on-accent",
+};
+
+export const TOOL_TILES = {
+  "ai-chat": {
+    label: "对话聊天",
+    description: "询问AI当前视频的具体细节",
+    icon: MessageSquare,
+    ...SHARED_TOOL_VISUALS,
+  },
+  overview: {
+    label: "逐字稿阅览",
+    description: "显示原文逐字稿",
+    icon: FileText,
+    ...SHARED_TOOL_VISUALS,
+  },
+  "ai-summary": {
+    label: "AI 概括",
+    description: "生成总结与学习笔记",
+    icon: ListChecks,
+    ...SHARED_TOOL_VISUALS,
+  },
+  mindmap: {
+    label: "思维导图",
+    description: "梳理知识结构与章节关系",
+    icon: Network,
+    ...SHARED_TOOL_VISUALS,
+  },
+  "knowledge-cards": {
+    label: "知识卡片",
+    description: "知识、标签与来源卡片",
+    icon: BrainCircuit,
+    ...SHARED_TOOL_VISUALS,
+  },
+  notes: {
+    label: "人工笔记",
+    description: "记录自己的笔记与待办",
+    icon: StickyNote,
+    ...SHARED_TOOL_VISUALS,
+  },
+  preview: {
+    label: "视频预览",
+    description: "查看原始视频内容",
+    icon: PlaySquare,
+    ...SHARED_TOOL_VISUALS,
+  },
+};
+
+export const SERIES_TOOL_TILES = {
+  "series-overview": {
+    label: "全局 AI 概括",
+    description: "汇总全部视频的 AI 概括",
+    icon: FileText,
+    ...SHARED_TOOL_VISUALS,
+  },
+  "series-mindmap": {
+    label: "全局思维导图",
+    description: "梳理系列知识脉络",
+    icon: Network,
+    ...SHARED_TOOL_VISUALS,
+  },
+};
+
+export const SERIES_STUDIO_TOOL_TILES = {
+  "ai-chat": TOOL_TILES["ai-chat"],
+  "series-overview": SERIES_TOOL_TILES["series-overview"],
+  "series-mindmap": SERIES_TOOL_TILES["series-mindmap"],
+};
+
+const DEFAULT_TOOL_META = {
+  label: "工具页",
+  description: "当前工具信息正在同步",
+  icon: FileText,
+  palette: "workspace-panel border text-strong transition-all",
+  iconShell: "bg-soft text-body border border-line-soft",
+  arrowShell: "bg-muted text-body",
+};
+
+export const SOURCE_MISSING_STATUS = { label: "需先链接媒体", tone: "blocked" };
+
+/**
+ * Tool status descriptor — `{ label, tone }`.
+ *
+ * These tiles used to render a bare grey string in a fixed slot, but that one
+ * slot carried four unrelated meanings (a chat session name, "loading", "not
+ * generated yet", "generates on click"). Same position, same size, so users
+ * could not build an expectation. The status is now an explicit chip whose
+ * `tone` makes the four cases visually distinct:
+ *
+ *   ready   — nothing to do, the tool already has content
+ *   pending — usable, will generate on click
+ *   blocked — disabled until something else happens
+ *   loading — state not resolved yet
+ *
+ * A missing/unknown state deliberately degrades to `loading` rather than
+ * claiming the tool is ready.
+ */
+export function describeToolState(toolId, toolState) {
+  if (!toolState) {
+    return { label: "读取中", tone: "loading" };
+  }
+  if (toolState.status === "source_missing") {
+    return SOURCE_MISSING_STATUS;
+  }
+  if (toolId === "preview") {
+    return { label: "随时可查看", tone: "ready" };
+  }
+  if (toolId === "notes") {
+    return { label: toolState.generated ? "可记录" : "可立即使用", tone: "ready" };
+  }
+  if (toolState.generated) {
+    return { label: "已生成", tone: "ready" };
+  }
+  if (toolState.available === false) {
+    return { label: "需先生成 AI 概括", tone: "blocked" };
+  }
+  return { label: "点击进入后生成", tone: "pending" };
+}
+
+export function getToolState(tools, toolId) {
+  if (!tools) {
+    return null;
+  }
+  if (toolId === "knowledge-cards") {
+    return tools.knowledgeCards ?? null;
+  }
+  if (toolId === "ai-summary") {
+    return tools.aiSummary ?? null;
+  }
+  return tools[toolId] ?? null;
+}
+
+export function getToolMeta(toolId) {
+  return TOOL_TILES[toolId] ?? SERIES_TOOL_TILES[toolId] ?? null;
+}
+
+export function resolveToolMeta(toolId) {
+  return getToolMeta(toolId) ?? DEFAULT_TOOL_META;
+}

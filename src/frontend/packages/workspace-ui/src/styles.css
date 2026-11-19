@@ -1,0 +1,948 @@
+@import "katex/dist/katex.min.css";
+@import "react-mosaic-component/react-mosaic-component.css";
+/* The UI uses the platform's native UI stack. On Apple systems this resolves to
+   SF Pro; on Windows it falls back to Segoe UI and the system Chinese face. No
+   webfont is downloaded, which keeps first paint fast and offline rendering
+   identical. */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Every colour the UI uses is one of these variables (RGB channels, so Tailwind can add
+     alpha). Components name a role — text-strong, bg-surface, border-line, text-danger — and
+     never a hue or a dark: shade; tailwind.colors.js maps the roles onto the variables. */
+  :root {
+    color-scheme: light;
+
+    /* Surfaces: Apple system grays. White grouped cards sit on a cool canvas. */
+    --canvas: 242 242 247;        /* #F2F2F7 */
+    --surface: 255 255 255;
+    --muted: 249 249 251;
+    --raised: 255 255 255;        /* dialogs, popovers, menus */
+    --sunken: 249 249 251;        /* inputs */
+    --soft: 242 242 247;          /* chips, hover on surface */
+    --softer: 229 229 234;        /* hover on soft, tracks */
+    --inverse: 28 28 30;          /* solid neutral buttons, tooltips */
+
+    /* Text */
+    --strong: 28 28 30;           /* label */
+    --body: 58 58 60;             /* secondaryLabel */
+    --subtle: 84 84 88;
+    --faint: 99 99 102;           /* tertiaryLabel, still ≥ 4.5:1 on white */
+    --ghost: 142 142 147;         /* placeholder */
+    --on-inverse: 255 255 255;
+    --on-accent: 255 255 255;
+
+    /* Lines */
+    --line-soft: 242 242 247;
+    --line: 229 229 234;
+    --line-strong: 209 209 214;
+
+    --workspace-accent-color: 0 122 255;   /* Apple system blue #007AFF */
+
+    --workspace-shell-bg: rgb(var(--canvas));
+    --workspace-panel-bg: rgb(var(--surface));
+    --workspace-panel-border: rgba(60, 60, 67, 0.14);
+    --workspace-panel-shadow:
+      0 0 0 0.5px rgba(0, 0, 0, 0.035),
+      0 2px 10px rgba(0, 0, 0, 0.025);
+    --workspace-muted-bg: rgb(var(--muted));
+    --workspace-muted-border: rgba(60, 60, 67, 0.10);
+    --workspace-toolbar-bg: rgba(255, 255, 255, 0.82);
+    --workspace-hero-bg: rgb(var(--surface));
+    --workspace-elevated-bg: rgb(var(--raised));
+    --workspace-elevated-shadow:
+      0 0 0 0.5px rgba(0, 0, 0, 0.04),
+      0 12px 36px rgba(0, 0, 0, 0.12);
+    --workspace-input-bg: rgb(var(--sunken));
+    --workspace-accent-bg: rgb(var(--workspace-accent-color) / 0.08);
+    --workspace-accent-border: rgb(var(--workspace-accent-color) / 0.24);
+    --workspace-glow:
+      0 0 0 0.5px rgba(0, 0, 0, 0.04),
+      0 8px 24px rgba(0, 0, 0, 0.05);
+
+    /* Status: text / tinted background / border / solid fill */
+    --color-danger:        215 0 21;    /* accessible light-mode label */
+    --color-danger-bg:     255 235 233;
+    --color-danger-border: 255 138 128;
+    --color-danger-muted:  255 59 48;   /* Apple system red */
+
+    --color-warning:        179 90 0;
+    --color-warning-bg:     255 248 235;
+    --color-warning-border: 255 204 128;
+    --color-warning-muted:  255 149 0;  /* Apple system orange */
+
+    --color-success:        36 138 61;
+    --color-success-bg:     235 249 239;
+    --color-success-border: 145 220 163;
+    --color-success-muted:  52 199 89;  /* Apple system green */
+
+    --color-info:        0 102 204;
+    --color-info-bg:     235 244 255;
+    --color-info-border: 153 200 255;
+    --color-info-muted:  0 122 255;
+  }
+
+  /* Dark: slate and chalk. Grey-green slate instead of black, so the screen gives off less
+     light; chalk-white text tops out around 87% lightness (11–13:1 on panels) instead of pure
+     white; chalk yellow accent; the four status colours share one lightness and saturation. */
+  .dark {
+    color-scheme: dark;
+
+    --canvas: 0 0 0;               /* Apple dark system background */
+    --surface: 28 28 30;           /* #1C1C1E */
+    --muted: 44 44 46;             /* #2C2C2E */
+    --raised: 44 44 46;
+    --sunken: 44 44 46;
+    --soft: 44 44 46;
+    --softer: 58 58 60;            /* #3A3A3C */
+    --inverse: 242 242 247;
+
+    --strong: 255 255 255;
+    --body: 235 235 240;
+    --subtle: 198 198 204;
+    --faint: 152 152 157;
+    --ghost: 124 124 128;
+    --on-inverse: 28 28 30;
+    --on-accent: 255 255 255;
+
+    --line-soft: 44 44 46;
+    --line: 56 56 58;              /* #38383A */
+    --line-strong: 72 72 74;       /* #48484A */
+
+    --workspace-accent-color: 10 132 255;  /* Apple dark system blue */
+
+    --workspace-panel-border: rgb(var(--line));
+    --workspace-panel-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 10px 30px rgba(8, 10, 9, 0.35);
+    --workspace-muted-border: rgb(var(--line) / 0.8);
+    --workspace-toolbar-bg: rgba(28, 28, 30, 0.80);
+    --workspace-hero-bg: rgb(var(--canvas));
+    --workspace-elevated-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+    --workspace-accent-bg: rgb(var(--workspace-accent-color) / 0.08);
+    --workspace-accent-border: rgb(var(--workspace-accent-color) / 0.28);
+    --workspace-glow: none;
+
+    --color-danger:        255 105 97;
+    --color-danger-bg:     58 28 27;
+    --color-danger-border: 111 45 42;
+    --color-danger-muted:  255 69 58;
+
+    --color-warning:        255 179 64;
+    --color-warning-bg:     58 43 20;
+    --color-warning-border: 112 77 30;
+    --color-warning-muted:  255 159 10;
+
+    --color-success:        48 209 88;
+    --color-success-bg:     24 58 32;
+    --color-success-border: 45 111 60;
+    --color-success-muted:  48 209 88;
+
+    --color-info:        100 210 255;
+    --color-info-bg:     21 47 58;
+    --color-info-border: 39 91 111;
+    --color-info-muted:  10 132 255;
+  }
+}
+
+@layer base {
+
+  html,
+  body,
+  #root {
+    transition:
+      background-color 320ms cubic-bezier(0.22, 1, 0.36, 1),
+      color 320ms cubic-bezier(0.22, 1, 0.36, 1),
+      border-color 320ms cubic-bezier(0.22, 1, 0.36, 1),
+      box-shadow 320ms cubic-bezier(0.22, 1, 0.36, 1),
+      background 420ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  body {
+    @apply text-strong font-sans antialiased overflow-hidden overscroll-none m-0;
+    background: var(--workspace-shell-bg);
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+
+    transition:
+      background-color 220ms ease,
+      color 220ms ease,
+      border-color 220ms ease,
+      box-shadow 220ms ease,
+      background 280ms ease;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  #root {
+    @apply h-dvh flex flex-col relative z-0;
+  }
+
+  /* Reset button and input fonts to inherit */
+  button,
+  input {
+    font: inherit;
+  }
+
+  /* ── Keyboard focus indicator (WCAG 2.4.7 Focus Visible) ──
+     Provides a consistent accent-colored outline for keyboard
+     navigation. Elements that already declare their own focus style
+     (e.g. inputs with `focus:border-accent` + `outline-none`) keep
+     that style because Tailwind utilities win source-order over base.
+     This rule fills the gap for icon buttons / link-style controls
+     that previously had no visible focus ring. */
+  :focus-visible {
+    outline: 2px solid rgb(var(--workspace-accent-color));
+    outline-offset: 2px;
+  }
+
+  /* Mouse clicks should not show the keyboard focus ring */
+  :focus:not(:focus-visible) {
+    outline: none;
+  }
+
+  * {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  ::selection {
+    background: rgb(var(--workspace-accent-color) / 0.20);
+  }
+
+  *::-webkit-scrollbar {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+
+  .theme-transitioning,
+  .theme-transitioning *,
+  .theme-transitioning *::before,
+  .theme-transitioning *::after {
+    transition:
+      background-color 420ms cubic-bezier(0.22, 1, 0.36, 1) !important,
+      color 420ms cubic-bezier(0.22, 1, 0.36, 1) !important,
+      border-color 420ms cubic-bezier(0.22, 1, 0.36, 1) !important,
+      box-shadow 420ms cubic-bezier(0.22, 1, 0.36, 1) !important,
+      background 520ms cubic-bezier(0.22, 1, 0.36, 1) !important,
+      fill 420ms cubic-bezier(0.22, 1, 0.36, 1) !important,
+      stroke 420ms cubic-bezier(0.22, 1, 0.36, 1) !important,
+      opacity 320ms cubic-bezier(0.22, 1, 0.36, 1) !important;
+  }
+}
+
+@layer components {
+
+  .workspace-panel,
+  .workspace-muted-panel,
+  .workspace-toolbar-surface,
+  .workspace-hero-surface,
+  .workspace-elevated-panel,
+  .workspace-accent-panel,
+  .workspace-input-surface {
+    transition:
+      background-color 260ms ease,
+      border-color 260ms ease,
+      color 260ms ease,
+      box-shadow 260ms ease,
+      backdrop-filter 260ms ease,
+      background 320ms ease;
+  }
+
+  .workspace-panel {
+    background: var(--workspace-panel-bg);
+    border-color: var(--workspace-panel-border);
+    box-shadow: var(--workspace-panel-shadow);
+    backdrop-filter: saturate(180%) blur(20px);
+  }
+  .dark .workspace-panel {
+    backdrop-filter: saturate(180%) blur(24px);
+  }
+
+  .workspace-muted-panel {
+    background: var(--workspace-muted-bg);
+    border-color: var(--workspace-muted-border);
+    /* Light: slate-50 inset — lower than panel, no shadow */
+    box-shadow: none;
+  }
+  .dark .workspace-muted-panel {
+    box-shadow: var(--workspace-glow);
+  }
+
+  .workspace-toolbar-surface {
+    background: var(--workspace-toolbar-bg);
+    border-color: var(--workspace-panel-border);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    backdrop-filter: saturate(180%) blur(20px);
+    box-shadow: 0 0.5px 0 rgba(60, 60, 67, 0.16);
+  }
+  .dark .workspace-toolbar-surface {
+    box-shadow: none;
+  }
+
+  .workspace-hero-surface {
+    background: var(--workspace-hero-bg);
+    border-color: var(--workspace-muted-border);
+    box-shadow: var(--workspace-glow);
+  }
+
+  .workspace-elevated-panel {
+    background: var(--workspace-elevated-bg);
+    border-color: var(--workspace-muted-border);
+    /* Light: stronger shadow than panel to float higher */
+    box-shadow: var(--workspace-elevated-shadow, var(--workspace-panel-shadow));
+  }
+  .dark .workspace-elevated-panel {
+    box-shadow: var(--workspace-panel-shadow);
+  }
+
+  .workspace-accent-panel {
+    background: var(--workspace-accent-bg);
+    border-color: var(--workspace-accent-border);
+    box-shadow: var(--workspace-glow);
+  }
+
+  .workspace-input-surface {
+    background: var(--workspace-input-bg);
+    border-color: var(--workspace-panel-border);
+    /* Light: subtle inset shadow for depth */
+    box-shadow: inset 0 1px 3px rgba(15, 23, 42, 0.04);
+  }
+  .dark .workspace-input-surface {
+    box-shadow: var(--workspace-glow);
+  }
+
+  /* Semantic colours (text-danger, bg-warning-subtle, border-success-border, …) come from
+     tailwind.colors.js and read the --color-* variables above. */
+
+  /* primary button: solid accent */
+  .btn-primary {
+    background-color: rgb(var(--workspace-accent-color));
+    color: rgb(var(--on-accent));
+    transition: opacity 150ms ease, transform 100ms ease;
+  }
+  .btn-primary:hover  { opacity: 0.9; }
+  .btn-primary:active { transform: scale(0.98); }
+
+  /* secondary / ghost button */
+  .btn-secondary {
+    background-color: transparent;
+    border: 1px solid rgb(var(--workspace-accent-color) / 0.3);
+    color: rgb(var(--workspace-accent-color));
+    transition: background-color 150ms ease;
+  }
+  .btn-secondary:hover { background-color: rgb(var(--workspace-accent-color) / 0.06); }
+
+  /* danger button */
+  .btn-danger {
+    background-color: rgb(var(--color-danger-muted));
+    color: #fff;
+    transition: opacity 150ms ease, transform 100ms ease;
+  }
+  .btn-danger:hover  { opacity: 0.88; }
+  .btn-danger:active { transform: scale(0.98); }
+
+  /* danger ghost */
+  .btn-danger-ghost {
+    background-color: rgb(var(--color-danger-bg));
+    color: rgb(var(--color-danger));
+    border: 1px solid rgb(var(--color-danger-border));
+    transition: background-color 150ms ease;
+  }
+  .btn-danger-ghost:hover { opacity: 0.85; }
+
+  .motion-fade-up {
+    animation: workspace-fade-up 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .motion-fade-scale {
+    animation: workspace-fade-scale 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .motion-slide-in {
+    animation: workspace-slide-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .motion-stagger {
+    animation: workspace-fade-up 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    animation-delay: calc(var(--stagger-index, 0) * 40ms);
+  }
+
+  .motion-busy-button {
+    animation: workspace-button-bounce 220ms cubic-bezier(0.2, 0.9, 0.2, 1);
+  }
+
+  .motion-arrow-shift {
+    transition:
+      transform 200ms ease,
+      color 200ms ease,
+      background-color 200ms ease,
+      filter 200ms ease;
+  }
+
+  .group:hover .motion-arrow-shift {
+    transform: translateX(2px);
+  }
+
+  .note-frame-image {
+    transform: scale(1);
+    transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .note-frame-trigger:hover .note-frame-image,
+  .note-frame-trigger:focus-visible .note-frame-image {
+    transform: scale(1.012);
+  }
+
+  .motion-shimmer {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .motion-shimmer::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(90deg,
+        transparent,
+        rgba(255, 255, 255, 0.5),
+        transparent);
+    animation: workspace-shimmer 1.3s linear infinite;
+  }
+
+  .dark .motion-shimmer::after {
+    background: linear-gradient(90deg,
+        transparent,
+        rgba(255, 255, 255, 0.08),
+        transparent);
+  }
+}
+
+@keyframes workspace-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes workspace-fade-scale {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.985);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes workspace-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(12px) translateY(-4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0) translateY(0);
+  }
+}
+
+@keyframes workspace-button-bounce {
+  0% {
+    transform: scale(1);
+  }
+
+  40% {
+    transform: scale(0.97);
+  }
+
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes workspace-shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+
+  .motion-fade-up,
+  .motion-fade-scale,
+  .motion-slide-in,
+  .motion-stagger,
+  .motion-busy-button {
+    animation: none !important;
+  }
+
+  .motion-shimmer::after {
+    animation: none !important;
+  }
+
+  .animate-ping,
+  .animate-pulse {
+    animation: none !important;
+  }
+
+  .motion-arrow-shift,
+  .note-frame-image,
+  .workspace-panel,
+  .workspace-muted-panel,
+  .workspace-toolbar-surface,
+  .workspace-elevated-panel,
+  .workspace-input-surface,
+  button,
+  video {
+    transition-duration: 0.01ms !important;
+  }
+}
+
+.markdown-body {
+  line-height: 1.75;
+}
+
+.markdown-body>*:first-child {
+  margin-top: 0;
+}
+
+.markdown-body>*:last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body pre,
+.markdown-body blockquote,
+.markdown-body table {
+  margin: 0.75rem 0;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4 {
+  margin: 1rem 0 0.5rem;
+  font-weight: 700;
+  color: inherit;
+}
+
+.markdown-body h1 {
+  font-size: 1.25rem;
+}
+
+.markdown-body h2 {
+  font-size: 1.125rem;
+}
+
+.markdown-body h3,
+.markdown-body h4 {
+  font-size: 1rem;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  padding-left: 1.3rem;
+}
+
+.markdown-body li+li {
+  margin-top: 0.3rem;
+}
+
+.markdown-body code {
+  border-radius: 0.5rem;
+  background: rgb(var(--soft));
+  padding: 0.1rem 0.4rem;
+  font-size: 0.92em;
+}
+
+.markdown-body pre {
+  overflow-x: auto;
+  border-radius: 1rem;
+  background: rgb(var(--soft));
+  padding: 0.9rem 1rem;
+  color: rgb(var(--body));
+}
+
+.markdown-body pre code {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+}
+
+.markdown-body blockquote {
+  border-left: 3px solid rgb(var(--line-strong));
+  padding-left: 0.9rem;
+  color: rgb(var(--subtle));
+}
+
+.markdown-body a {
+  color: rgb(var(--color-info));
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+
+.markdown-body a.citation-marker,
+.markdown-body a.citation-marker:visited,
+.markdown-body a.citation-marker:hover,
+.markdown-body a.citation-marker:focus {
+  color: rgb(var(--strong));
+  text-decoration: none;
+}
+
+.markdown-body table {
+  width: 100%;
+  border-collapse: collapse;
+  overflow: hidden;
+  border-radius: 0.9rem;
+}
+
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid rgb(var(--line));
+  padding: 0.55rem 0.7rem;
+  text-align: left;
+}
+
+.markdown-body th {
+  background: rgb(var(--muted));
+}
+
+.mindmap-selected > circle {
+  stroke: rgb(var(--workspace-accent-color));
+  stroke-width: 4;
+  filter: drop-shadow(0 0 5px color-mix(in srgb, rgb(var(--workspace-accent-color)) 55%, transparent));
+}
+
+.mindmap-selected text {
+  fill: rgb(var(--workspace-accent-color));
+  font-weight: 700;
+}
+
+.mindmap-svg .markmap-node {
+  cursor: pointer;
+  user-select: none;
+  transition: filter 160ms ease;
+}
+
+.mindmap-svg .markmap-node:hover > circle {
+  stroke: rgb(var(--workspace-accent-color));
+  stroke-width: 2.5;
+}
+
+.mindmap-svg .markmap-node.mindmap-hovered > circle {
+  stroke: rgb(var(--workspace-accent-color));
+  stroke-width: 2.5;
+}
+
+.mindmap-svg .markmap-node:hover .markmap-foreign > div > div,
+.mindmap-svg .markmap-node.mindmap-hovered .markmap-foreign > div > div {
+  background: color-mix(in srgb, rgb(var(--workspace-accent-color)) 7%, transparent);
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px color-mix(in srgb, rgb(var(--workspace-accent-color)) 22%, transparent);
+  transition: background-color 140ms ease, box-shadow 140ms ease;
+}
+
+.mindmap-svg .markmap-foreign,
+.mindmap-svg .markmap-foreign * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
+.workspace-mosaic {
+  background: transparent;
+}
+
+.workspace-mosaic .mosaic-root {
+  inset: 0;
+}
+
+.workspace-mosaic .mosaic-tile {
+  margin: 2px;
+}
+
+.workspace-mosaic .workspace-mosaic-window {
+  border: 1px solid var(--workspace-panel-border);
+  border-radius: 18px;
+  overflow: hidden;
+  background: var(--workspace-panel-bg);
+  box-shadow: var(--workspace-panel-shadow);
+}
+
+.workspace-mosaic .workspace-mosaic-window-focused {
+  box-shadow: 0 0 0 1px rgb(var(--workspace-accent-color) / 0.38), var(--workspace-panel-shadow);
+}
+
+.workspace-mosaic .workspace-mosaic-window .mosaic-window-toolbar {
+  height: auto;
+  min-height: 42px;
+  background: var(--workspace-toolbar-bg);
+  -webkit-backdrop-filter: saturate(180%) blur(18px);
+  backdrop-filter: saturate(180%) blur(18px);
+  box-shadow: none;
+}
+
+.workspace-mosaic .workspace-mosaic-window .mosaic-window-body {
+  background: transparent;
+}
+
+.workspace-mosaic .mosaic-split:hover {
+  background: transparent;
+}
+
+.workspace-mosaic .mosaic-split .mosaic-split-line {
+  background: transparent;
+  border-radius: 999px;
+  transition: background-color 150ms ease, box-shadow 150ms ease;
+}
+
+.workspace-mosaic .mosaic-split:hover .mosaic-split-line {
+  background: rgb(var(--workspace-accent-color));
+  box-shadow: 0 0 0 1px rgb(var(--workspace-accent-color) / 0.2);
+}
+
+.workspace-mosaic .drop-target-container .drop-target {
+  border-color: rgb(var(--workspace-accent-color));
+  background: rgb(var(--workspace-accent-color) / 0.16);
+}
+
+.workspace-mosaic-drag-preview {
+  display: none;
+}
+
+.workspace-video-stage {
+  container-type: size;
+}
+
+.workspace-video-frame {
+  width: min(100cqw, calc(100cqh * 16 / 9));
+  aspect-ratio: 16 / 9;
+}
+
+.workspace-mosaic-action {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  color: rgb(var(--faint));
+  transition: background-color 150ms ease, color 150ms ease;
+}
+
+.workspace-mosaic-action:hover {
+  background: rgb(var(--workspace-accent-color) / 0.1);
+  color: rgb(var(--workspace-accent-color));
+}
+
+/* Phones and portrait tablets get touch targets sized for a thumb, not a mouse
+   pointer. Keep the icon visually compact while giving the whole control a
+   40px hit area. */
+@media (max-width: 1023px) {
+  .workspace-mosaic-action.workspace-mosaic-action,
+  .workspace-back-button.workspace-back-button:not(.workspace-back-button--breadcrumb) {
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    border-radius: 999px;
+  }
+
+  .workspace-back-button.workspace-back-button:not(.workspace-back-button--breadcrumb) {
+    justify-content: center;
+    padding: 0;
+  }
+
+  .workspace-back-button.workspace-back-button--breadcrumb {
+    height: 40px;
+    min-height: 40px;
+    padding-inline: 8px;
+    border-radius: 10px;
+  }
+
+  .workspace-export-trigger.workspace-export-trigger {
+    min-width: 40px;
+    height: 40px;
+    padding-inline: 8px;
+    border-radius: 10px;
+  }
+
+  .workspace-export-item {
+    min-height: 44px;
+    padding-block: 10px;
+  }
+
+  .workspace-search-input.workspace-search-input {
+    min-height: 44px;
+    font-size: 16px;
+  }
+
+  .workspace-search-clear.workspace-search-clear {
+    width: 40px;
+    height: 40px;
+  }
+
+  .workspace-drawer-close.workspace-drawer-close {
+    width: 44px;
+    height: 44px;
+  }
+
+  .workspace-content-action.workspace-content-action {
+    width: 40px;
+    height: 40px;
+  }
+
+  .workspace-sidebar-close.workspace-sidebar-close {
+    width: 44px;
+    height: 44px;
+    right: 8px;
+    top: 8px;
+  }
+
+  .workspace-library-home-link.workspace-library-home-link,
+  .workspace-library-add-video.workspace-library-add-video {
+    min-height: 44px;
+  }
+
+  .workspace-library-add-video.workspace-library-add-video {
+    padding-block: 0;
+  }
+
+  .workspace-filter-group.workspace-filter-group {
+    padding: 2px;
+  }
+
+  .workspace-filter-option.workspace-filter-option {
+    min-height: 40px;
+  }
+
+  .workspace-video-select.workspace-video-select {
+    width: 40px;
+    height: 40px;
+  }
+
+  .workspace-home-sort-group.workspace-home-sort-group {
+    height: 44px;
+    padding: 2px;
+  }
+
+  .workspace-home-sort-option.workspace-home-sort-option {
+    height: 40px;
+  }
+
+  .workspace-bulk-toggle.workspace-bulk-toggle {
+    height: 44px;
+  }
+
+  .workspace-settings-shell.workspace-settings-shell {
+    height: min(92dvh, 900px);
+    border-radius: 28px;
+    flex-direction: column;
+  }
+
+  .workspace-settings-sidebar.workspace-settings-sidebar {
+    width: 100%;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-right: 0;
+    border-bottom: 1px solid rgb(var(--line) / 0.8);
+  }
+
+  .workspace-settings-brand.workspace-settings-brand {
+    display: none;
+  }
+
+  .workspace-settings-tabs.workspace-settings-tabs {
+    flex-direction: row;
+    flex: 1 1 auto;
+    min-width: 0;
+    gap: 4px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+  }
+
+  .workspace-settings-tab.workspace-settings-tab {
+    flex: 0 0 auto;
+    min-height: 40px;
+    padding: 8px 12px;
+    white-space: nowrap;
+    border-radius: 12px;
+  }
+
+  .workspace-settings-reset.workspace-settings-reset {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    flex: 0 0 auto;
+  }
+
+  .workspace-settings-reset-button.workspace-settings-reset-button {
+    width: auto;
+    min-height: 40px;
+    padding-inline: 10px;
+    white-space: nowrap;
+  }
+
+  .workspace-settings-close.workspace-settings-close {
+    width: 44px;
+    height: 44px;
+  }
+
+  .workspace-usage-close.workspace-usage-close {
+    width: 44px;
+    height: 44px;
+  }
+
+  .workspace-toolbar-sidebar-toggle.workspace-toolbar-sidebar-toggle {
+    width: 44px;
+    height: 44px;
+  }
+
+  .workspace-mobile-panel-tab.workspace-mobile-panel-tab {
+    height: 40px;
+  }
+
+  .workspace-mindmap-action.workspace-mindmap-action {
+    width: 40px;
+    height: 40px;
+  }
+
+  .workspace-mindmap-toggle.workspace-mindmap-toggle {
+    width: 40px;
+    height: 40px;
+  }
+}
+
+/* Progress of work whose percentage we do not know: a short bar sweeping across its track. */
+@keyframes workspace-progress-sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(300%); }
+}
+.workspace-progress-indeterminate {
+  animation: workspace-progress-sweep 1.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .workspace-progress-indeterminate { animation: none; width: 100%; opacity: 0.5; }
+}
+
+/* Placeholder text is real copy: keep it at the readable secondary-text
+   contrast instead of the disabled-control grey. This sits after Tailwind's
+   utilities so `placeholder:text-ghost` cannot override it. */
+input[placeholder]::placeholder,
+textarea[placeholder]::placeholder {
+  color: rgb(var(--faint));
+  opacity: 1;
+}

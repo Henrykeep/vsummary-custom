@@ -1,0 +1,838 @@
+import { useEffect } from "react";
+import { buildAgentChatContextPayload } from "./workspaceChatRuntime";
+import { BACKEND_HEALTH_RETRY_DELAY_MS } from "./workspaceControllerConstants";
+import {
+  buildSeriesGenerationTaskKey,
+  buildVideoGenerationTaskKey,
+  findVideoById,
+  getGenerationTaskForSelection,
+  hasRecoveredChatScope,
+  isGenerationSnapshotActive,
+} from "./workspaceState";
+export function createWorkspaceDataEffects(api){
+const {checkBackendHealth,loadAgentContextUsage,loadAgentMemoryStatus,loadAgentSessionRecovery,loadSeriesGenerationStatus,loadSeriesMindmap,loadVideoKnowledgeCards,loadVideoAiSummary,loadVideoGenerationStatus,loadVideoMindmap,loadVideoNotes,loadVideoSummary,loadVideoTools,loadWorkspaceLibrary,subscribeSeriesGenerationProgress,subscribeDurableJobProgress}=api;
+const generationSubscriptions = new Map();
+
+function clearGenerationSubscription(taskKey) {
+  const unsubscribe = generationSubscriptions.get(taskKey);
+  if (typeof unsubscribe === "function") {
+    unsubscribe();
+  }
+  generationSubscriptions.delete(taskKey);
+}
+
+async function refreshCompletedVideoContent({ seriesId, videoId, dispatch }) {
+  const [library, tools] = await Promise.all([
+    loadWorkspaceLibrary(),
+    loadVideoTools(seriesId, videoId),
+  ]);
+  const summary = tools.overview?.generated
+    ? await loadVideoSummary(seriesId, videoId)
+    : null;
+  const aiSummary = tools.aiSummary?.generated
+    ? await loadVideoAiSummary(seriesId, videoId)
+    : null;
+  dispatch({ type: "video_generation_content_refreshed", seriesId, videoId, library, summary, tools, aiSummary });
+}
+
+function ensureVideoGenerationSubscription({ seriesId, videoId, jobId, dispatch }) {
+  const taskKey = buildVideoGenerationTaskKey(seriesId, videoId);
+  if (!taskKey || !jobId || generationSubscriptions.has(taskKey)) {
+    return;
+  }
+  const unsubscribe = subscribeDurableJobProgress(jobId, (snapshot) => {
+    dispatch({
+      type: "generation_progress_updated",
+      taskKey,
+      mode: "video",
+      seriesId,
+      videoId,
+      jobId,
+      progress: snapshot.progress,
+      snapshot,
+      subscriptionActive: isGenerationSnapshotActive(snapshot),
+    });
+    if (snapshot.status === "completed" || snapshot.status === "failed" || snapshot.status === "cancelled") {
+      clearGenerationSubscription(taskKey);
+    }
+    if (snapshot.status === "completed") {
+      refreshCompletedVideoContent({ seriesId, videoId, dispatch }).catch(() => {});
+    }
+    if (snapshot.status === "failed" && snapshot.error) {
+      dispatch({ type: "load_failed", message: snapshot.error });
+    }
+  });
+  generationSubscriptions.set(taskKey, unsubscribe);
+}
+
+function ensureSeriesGenerationSubscription({ seriesId, runId, jobId, dispatch }) {
+  const taskKey = buildSeriesGenerationTaskKey(seriesId);
+  const subscriptionKey = `${taskKey}:${jobId}`;
+  if (!taskKey || !jobId || generationSubscriptions.has(subscriptionKey)) {
+    return;
+  }
+  const unsubscribe = subscribeSeriesGenerationProgress(seriesId, jobId, (snapshot) => {
+    dispatch({
+      type: "generation_progress_updated",
+      taskKey,
+      mode: "series",
+      seriesId,
+      runId,
+      jobId,
+      videoId: null,
+      progress: snapshot.progress,
+      snapshot,
+      subscriptionActive: isGenerationSnapshotActive(snapshot),
+    });
+    if (snapshot.status === "completed" || snapshot.status === "failed" || snapshot.status === "cancelled") {
+      clearGenerationSubscription(subscriptionKey);
+    }
+    if (snapshot.status === "completed") {
+      loadWorkspaceLibrary()
+        .then((library) => {
+          dispatch({
+            type: "series_generation_succeeded",
+            taskKey,
+            seriesId,
+            runId,
+            jobId,
+            library,
+          });
+          dispatch({
+            type: "series_generation_queue_finished",
+            seriesId,
+            runId,
+            status: "completed",
+            detail: snapshot.detail ?? undefined,
+          });
+        })
+        .catch((error) => dispatch({ type: "load_failed", message: error.message }));
+    }
+    if (snapshot.status === "failed" || snapshot.status === "cancelled") {
+      dispatch({
+        type: "series_generation_queue_finished",
+        seriesId,
+        runId,
+        status: snapshot.status,
+        detail: snapshot.detail ?? undefined,
+      });
+    }
+    if (snapshot.status === "failed" && snapshot.error) {
+      dispatch({ type: "load_failed", message: snapshot.error });
+    }
+  });
+  generationSubscriptions.set(subscriptionKey, unsubscribe);
+}
+
+function useWorkspaceDataEffects(state, dispatch) {
+  const completedContentJobs = [
+    state.generationTasksByKey[buildVideoGenerationTaskKey(state.selectedSeriesId, state.selectedVideoId)],
+    state.generationTasksByKey[buildSeriesGenerationTaskKey(state.selectedSeriesId)],
+  ].filter((task) => task?.snapshot?.status === "completed").map((task) => task.jobId).join("|");
+  const recoveryTask = getGenerationTaskForSelection(state);
+  const shouldRecoverGenerationProgress = Boolean(
+    recoveryTask?.snapshot?.connectionLost &&
+    isGenerationSnapshotActive(recoveryTask.snapshot),
+  );
+  useEffect(() => () => {
+    for (const taskKey of generationSubscriptions.keys()) {
+      clearGenerationSubscription(taskKey);
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timeoutId = null;
+
+    const pollBackendHealth = async () => {
+      try {
+        await checkBackendHealth();
+        if (!cancelled) {
+          dispatch({ type: "backend_health_ready" });
+        }
+      } catch {
+        if (cancelled) {
+          return;
+        }
+        timeoutId = window.setTimeout(pollBackendHealth, BACKEND_HEALTH_RETRY_DELAY_MS);
+      }
+    };
+
+    pollBackendHealth();
+
+    return () => {
+      cancelled = true;
+      if (timeoutId != null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [dispatch]);
+
+  useEffect(() => {
+    if (!state.backendReady) {
+      return;
+    }
+
+    let cancelled = false;
+
+    loadWorkspaceLibrary()
+      .then((library) => {
+        if (!cancelled) {
+          dispatch({ type: "workspace_loaded", library });
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          dispatch({
+            type: "load_failed",
+            message: error instanceof Error ? error.message : "加载失败",
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [dispatch, state.backendReady]);
+
+
+
+  useEffect(() => {
+    if (!state.backendReady) {
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId = null;
+
+    const pollMemoryStatus = async () => {
+      try {
+        const snapshot = await loadAgentMemoryStatus(state.selectedSeriesId);
+        if (cancelled) {
+          return;
+        }
+        dispatch({ type: "knowledge_memory_status_loaded", snapshot });
+        timeoutId = window.setTimeout(
+          pollMemoryStatus,
+          snapshot.status === "running" ? 1000 : 5000,
+        );
+      } catch (error) {
+        if (!cancelled) {
+          dispatch({ type: "knowledge_memory_status_loaded", snapshot: {
+            status: "failed", indexState: "unknown", videoStates: {},
+            error: error instanceof Error ? error.message : "无法检查检索索引状态，请确认服务连接。",
+          } });
+          timeoutId = window.setTimeout(pollMemoryStatus, 5000);
+        }
+      }
+    };
+
+    pollMemoryStatus();
+
+    return () => {
+      cancelled = true;
+      if (timeoutId != null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [dispatch, state.backendReady, state.selectedSeriesId]);
+
+
+
+
+
+
+
+
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return;
+    }
+    const root = document.documentElement;
+    const shouldAnimate = root.dataset.workspaceThemeReady === "true";
+    if (shouldAnimate) {
+      root.classList.add("theme-transitioning");
+    }
+    // "system" follows the OS setting and keeps following it while the page is open.
+    const systemDark = typeof window.matchMedia === "function" ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+    const applyTheme = () => root.classList.toggle("dark", state.ui.theme === "dark" || (state.ui.theme === "system" && Boolean(systemDark?.matches)));
+    applyTheme();
+    root.dataset.workspaceThemeReady = "true";
+    if (state.ui.theme === "system") systemDark?.addEventListener("change", applyTheme);
+    const timeoutId = shouldAnimate ? window.setTimeout(() => {
+      root.classList.remove("theme-transitioning");
+    }, 560) : null;
+    return () => {
+      systemDark?.removeEventListener("change", applyTheme);
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+        root.classList.remove("theme-transitioning");
+      }
+    };
+  }, [state.ui.theme]);
+
+  useEffect(() => {
+    if (!state.backendReady) {
+      return;
+    }
+    if (state.selectedContextType === "video" && state.selectedSeriesId && state.selectedVideoId) {
+      let cancelled = false;
+      loadVideoGenerationStatus(state.selectedSeriesId, state.selectedVideoId)
+        .then(({ snapshot, jobId }) => {
+          if (cancelled) {
+            return;
+          }
+          dispatch({
+            type: "generation_status_loaded",
+            taskKey: buildVideoGenerationTaskKey(state.selectedSeriesId, state.selectedVideoId),
+            mode: "video",
+            seriesId: state.selectedSeriesId,
+            videoId: state.selectedVideoId,
+            jobId,
+            snapshot,
+            subscriptionActive: isGenerationSnapshotActive(snapshot),
+          });
+        })
+        .catch(() => {});
+
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (state.selectedContextType === "series" && state.selectedSeriesId) {
+      let cancelled = false;
+      loadSeriesGenerationStatus(state.selectedSeriesId)
+        .then(({ snapshot, jobId }) => {
+          if (cancelled) {
+            return;
+          }
+          dispatch({
+            type: "generation_status_loaded",
+            taskKey: buildSeriesGenerationTaskKey(state.selectedSeriesId),
+            mode: "series",
+            jobId,
+            seriesId: state.selectedSeriesId,
+            runId: state.seriesGenerationQueue?.seriesId === state.selectedSeriesId
+              ? state.seriesGenerationQueue.runId
+              : null,
+            videoId: null,
+            snapshot,
+            subscriptionActive: isGenerationSnapshotActive(snapshot),
+          });
+        })
+        .catch(() => {});
+
+      return () => {
+        cancelled = true;
+      };
+    }
+  }, [
+    dispatch,
+    state.backendReady,
+    state.library,
+    state.selectedContextType,
+    state.selectedSeriesId,
+    state.selectedVideoId,
+  ]);
+
+  useEffect(() => {
+    const currentTask = getGenerationTaskForSelection(state);
+    if (!currentTask) {
+      return;
+    }
+
+    if (currentTask.mode === "video" && currentTask.seriesId && currentTask.videoId) {
+      if (isGenerationSnapshotActive(currentTask.snapshot)) {
+        ensureVideoGenerationSubscription({
+          seriesId: currentTask.seriesId,
+          videoId: currentTask.videoId,
+          jobId: currentTask.jobId,
+          dispatch,
+        });
+      } else {
+        clearGenerationSubscription(currentTask.taskKey);
+      }
+      return;
+    }
+
+    if (currentTask.mode === "series" && currentTask.seriesId) {
+      if (isGenerationSnapshotActive(currentTask.snapshot)) {
+        ensureSeriesGenerationSubscription({
+          seriesId: currentTask.seriesId,
+          jobId: currentTask.jobId,
+          runId: state.seriesGenerationQueue?.seriesId === currentTask.seriesId
+            ? state.seriesGenerationQueue.runId
+            : null,
+          dispatch,
+        });
+      } else {
+        clearGenerationSubscription(`${currentTask.taskKey}:${currentTask.jobId}`);
+      }
+    }
+  }, [dispatch, state]);
+
+  useEffect(() => {
+    if (!shouldRecoverGenerationProgress || !recoveryTask?.taskKey) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    let timeoutId = null;
+    const mode = recoveryTask.mode;
+    const seriesId = recoveryTask.seriesId;
+    const videoId = recoveryTask.videoId;
+    const runId = recoveryTask.runId;
+    const fallbackJobId = recoveryTask.jobId;
+
+    const pollGenerationStatus = async () => {
+      try {
+        const payload = mode === "video"
+          ? await loadVideoGenerationStatus(seriesId, videoId)
+          : await loadSeriesGenerationStatus(seriesId);
+        if (cancelled) {
+          return;
+        }
+        const isActive = isGenerationSnapshotActive(payload.snapshot);
+        dispatch({
+          type: "generation_status_loaded",
+          taskKey: recoveryTask.taskKey,
+          mode,
+          seriesId,
+          videoId: videoId ?? null,
+          runId: runId ?? null,
+          jobId: payload.jobId ?? fallbackJobId,
+          snapshot: isActive
+            ? {
+                ...payload.snapshot,
+                connectionLost: true,
+                stage: "reconnecting",
+                detail: "进度连接已中断，正在通过状态接口同步...",
+              }
+            : payload.snapshot,
+          subscriptionActive: isActive,
+        });
+        if (isActive) {
+          timeoutId = window.setTimeout(pollGenerationStatus, 1500);
+          return;
+        }
+        if (payload.snapshot?.status === "completed") {
+          if (mode === "video" && seriesId && videoId) {
+            refreshCompletedVideoContent({ seriesId, videoId, dispatch }).catch(() => {});
+          } else if (mode === "series") {
+            loadWorkspaceLibrary()
+              .then((library) => {
+                dispatch({
+                  type: "series_generation_succeeded",
+                  taskKey: recoveryTask.taskKey,
+                  seriesId,
+                  runId: runId ?? null,
+                  jobId: payload.jobId ?? fallbackJobId,
+                  library,
+                });
+                dispatch({
+                  type: "series_generation_queue_finished",
+                  seriesId,
+                  runId: runId ?? null,
+                  status: "completed",
+                  detail: payload.snapshot.detail ?? undefined,
+                });
+              })
+              .catch(() => {});
+          }
+        }
+        if (mode === "series" && ["failed", "cancelled"].includes(payload.snapshot?.status)) {
+          dispatch({
+            type: "series_generation_queue_finished",
+            seriesId,
+            runId: runId ?? null,
+            status: payload.snapshot.status,
+            detail: payload.snapshot.detail ?? undefined,
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          timeoutId = window.setTimeout(pollGenerationStatus, 3000);
+        }
+      }
+    };
+
+    pollGenerationStatus();
+    return () => {
+      cancelled = true;
+      if (timeoutId != null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [
+    dispatch,
+    recoveryTask?.jobId,
+    recoveryTask?.mode,
+    recoveryTask?.runId,
+    recoveryTask?.seriesId,
+    recoveryTask?.taskKey,
+    recoveryTask?.videoId,
+    shouldRecoverGenerationProgress,
+  ]);
+
+  useEffect(() => {
+    if (!state.library || !state.chatScopeKey || !state.chatBaseScopeKey) {
+      return;
+    }
+    const sessionId = state.chatScopeKey;
+    if (hasRecoveredChatScope(state.chatRecoveryByScope, sessionId)) {
+      return;
+    }
+    const context = buildAgentChatContextPayload(
+      state.library,
+      state.selectedContextType,
+      state.selectedSeriesId,
+      state.selectedVideoId,
+    );
+
+    let cancelled = false;
+    dispatch({ type: "chat_recovery_started" });
+    loadAgentSessionRecovery(sessionId, context)
+      .then((recovery) => {
+        if (!cancelled) {
+          dispatch({
+            type: "chat_recovery_loaded",
+            chatScopeKey: sessionId,
+            restored: recovery.restored,
+            messages: recovery.messages,
+          });
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          dispatch({
+            type: "load_failed",
+            message: error instanceof Error ? error.message : "会话恢复失败",
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    dispatch,
+    state.library,
+    state.chatScopeKey,
+    state.chatBaseScopeKey,
+    state.selectedContextType,
+    state.selectedSeriesId,
+    state.selectedVideoId,
+    state.chatRecoveryByScope,
+  ]);
+
+  useEffect(() => {
+    if (!state.library || !state.chatScopeKey || !state.chatBaseScopeKey) {
+      return;
+    }
+    const sessionId = state.chatScopeKey;
+    const context = buildAgentChatContextPayload(
+      state.library,
+      state.selectedContextType,
+      state.selectedSeriesId,
+      state.selectedVideoId,
+    );
+
+    let cancelled = false;
+    dispatch({ type: "context_usage_loading_started" });
+    loadAgentContextUsage(sessionId, context)
+      .then((usage) => {
+        if (!cancelled) {
+          dispatch({
+            type: "context_usage_loaded",
+            chatScopeKey: sessionId,
+            currentScopeKey: state.chatScopeKey,
+            usage,
+          });
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          dispatch({
+            type: "load_failed",
+            message: error instanceof Error ? error.message : "上下文预算加载失败",
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    dispatch,
+    state.library,
+    state.chatScopeKey,
+    state.chatBaseScopeKey,
+    state.selectedContextType,
+    state.selectedSeriesId,
+    state.selectedVideoId,
+  ]);
+
+  useEffect(() => {
+    const selectedVideo = findVideoById(state.library, state.selectedSeriesId, state.selectedVideoId);
+    if (!selectedVideo || state.selectedContextType !== "video") {
+      dispatch({ type: "tools_loaded", tools: null });
+      return;
+    }
+    let cancelled = false;
+    dispatch({ type: "tools_loading_started" });
+    loadVideoTools(state.selectedSeriesId, state.selectedVideoId)
+      .then((tools) => {
+        if (!cancelled) {
+          dispatch({ type: "tools_loaded", tools });
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          dispatch({
+            type: "load_failed",
+            message: error instanceof Error ? error.message : "加载失败",
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [dispatch, state.library, state.selectedSeriesId, state.selectedVideoId, state.selectedContextType, completedContentJobs]);
+
+  useEffect(() => {
+    const selectedVideo = findVideoById(state.library, state.selectedSeriesId, state.selectedVideoId);
+    if (!selectedVideo || state.selectedContextType !== "video") {
+      dispatch({ type: "summary_cleared" });
+      return;
+    }
+    if (!state.tools?.overview.generated) {
+      dispatch({ type: "summary_cleared" });
+      return;
+    }
+
+    let cancelled = false;
+    dispatch({ type: "summary_loading_started" });
+    loadVideoSummary(state.selectedSeriesId, state.selectedVideoId)
+      .then((summary) => {
+        if (!cancelled) {
+          dispatch({ type: "summary_loaded", summary });
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          dispatch({
+            type: "load_failed",
+            message: error instanceof Error ? error.message : "加载失败",
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [dispatch, state.library, state.selectedSeriesId, state.selectedVideoId, state.selectedContextType, state.tools?.overview.generated]);
+
+  useEffect(() => {
+    const selectedVideo = findVideoById(state.library, state.selectedSeriesId, state.selectedVideoId);
+    if (
+      !selectedVideo ||
+      state.selectedContextType !== "video" ||
+      !state.tools?.mindmap.generated
+    ) {
+      dispatch({ type: "mindmap_cleared" });
+      return;
+    }
+
+    let cancelled = false;
+    dispatch({ type: "mindmap_loading_started" });
+    loadVideoMindmap(state.selectedSeriesId, state.selectedVideoId)
+      .then((mindmap) => {
+        if (!cancelled) {
+          dispatch({ type: "mindmap_loaded", mindmap });
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          dispatch({
+            type: "load_failed",
+            message: error instanceof Error ? error.message : "加载失败",
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [dispatch, state.library, state.selectedSeriesId, state.selectedVideoId, state.selectedContextType, state.tools?.mindmap.generated]);
+
+  useEffect(() => {
+    if (state.selectedContextType !== "series") {
+      dispatch({ type: "series_mindmap_cleared" });
+      return;
+    }
+
+    let cancelled = false;
+    dispatch({ type: "series_mindmap_loading_started" });
+    loadSeriesMindmap(state.selectedSeriesId)
+      .then((mindmap) => {
+        if (!cancelled) dispatch({ type: "series_mindmap_loaded", mindmap });
+      })
+      .catch((error) => {
+        if (!cancelled) dispatch({ type: "load_failed", message: error instanceof Error ? error.message : "加载系列导图失败" });
+      });
+
+    return () => { cancelled = true; };
+  }, [dispatch, state.selectedSeriesId, state.selectedContextType]);
+
+  useEffect(() => {
+    if (state.selectedContextType !== "series") {
+      dispatch({ type: "series_overview_cleared" });
+      return;
+    }
+
+    const activeSeries = state.library?.series?.find((series) => series.id === state.selectedSeriesId);
+    const processedVideos = activeSeries?.videos?.filter((video) => video.processed) ?? [];
+    if (!processedVideos.length) {
+      dispatch({ type: "series_overview_loaded", summariesByVideoId: {} });
+      return;
+    }
+
+    let cancelled = false;
+    dispatch({ type: "series_overview_loading_started" });
+    Promise.all(
+      processedVideos.map(async (video) => [
+        video.id,
+        await loadVideoSummary(state.selectedSeriesId, video.id),
+      ]),
+    )
+      .then((entries) => {
+        if (!cancelled) {
+          dispatch({
+            type: "series_overview_loaded",
+            summariesByVideoId: Object.fromEntries(entries),
+          });
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          dispatch({ type: "load_failed", message: error instanceof Error ? error.message : "加载系列概览失败" });
+        }
+      });
+
+    return () => { cancelled = true; };
+  }, [dispatch, state.library, state.selectedSeriesId, state.selectedContextType]);
+
+  useEffect(() => {
+    const selectedVideo = findVideoById(state.library, state.selectedSeriesId, state.selectedVideoId);
+    if (
+      !selectedVideo ||
+      state.selectedContextType !== "video" ||
+      !state.tools?.knowledgeCards.generated
+    ) {
+      dispatch({ type: "knowledge_cards_cleared" });
+      return;
+    }
+
+    let cancelled = false;
+    dispatch({ type: "knowledge_cards_loading_started" });
+    loadVideoKnowledgeCards(state.selectedSeriesId, state.selectedVideoId)
+      .then((cards) => {
+        if (!cancelled) {
+          dispatch({ type: "knowledge_cards_loaded", cards });
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          dispatch({
+            type: "load_failed",
+            message: error instanceof Error ? error.message : "知识卡片加载失败",
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [dispatch, state.library, state.selectedSeriesId, state.selectedVideoId, state.selectedContextType, state.tools?.knowledgeCards.generated]);
+
+  useEffect(() => {
+    const selectedVideo = findVideoById(state.library, state.selectedSeriesId, state.selectedVideoId);
+    if (!selectedVideo || state.selectedContextType !== "video") {
+      dispatch({ type: "ai_summary_cleared" });
+      return;
+    }
+    // Switching videos resets tools to null; until they arrive, "not generated" is not known yet.
+    if (!state.tools) {
+      dispatch({ type: "ai_summary_loading_started" });
+      return;
+    }
+    if (!state.tools.aiSummary.generated) {
+      dispatch({ type: "ai_summary_cleared" });
+      return;
+    }
+    let cancelled = false;
+    dispatch({ type: "ai_summary_loading_started" });
+    loadVideoAiSummary(state.selectedSeriesId, state.selectedVideoId)
+      .then((summary) => { if (!cancelled) dispatch({ type: "ai_summary_loaded", summary }); })
+      .catch((error) => { if (!cancelled) dispatch({ type: "load_failed", message: error instanceof Error ? error.message : "AI 概括加载失败" }); });
+    return () => { cancelled = true; };
+  }, [dispatch, state.library, state.selectedSeriesId, state.selectedVideoId, state.selectedContextType, state.tools == null, state.tools?.aiSummary.generated, completedContentJobs]);
+
+  useEffect(() => {
+    if (
+      state.selectedContextType !== "video" ||
+      !state.selectedSeriesId ||
+      !state.selectedVideoId ||
+      state.tools?.aiSummary?.status !== "running"
+    ) {
+      return undefined;
+    }
+    let cancelled = false;
+    const refresh = () => {
+      loadVideoTools(state.selectedSeriesId, state.selectedVideoId)
+        .then((tools) => { if (!cancelled) dispatch({ type: "tools_loaded", tools }); })
+        .catch(() => {});
+    };
+    const intervalId = window.setInterval(refresh, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [dispatch, state.selectedContextType, state.selectedSeriesId, state.selectedVideoId, state.tools?.aiSummary?.status]);
+
+  useEffect(() => {
+    const selectedVideo = findVideoById(state.library, state.selectedSeriesId, state.selectedVideoId);
+    if (
+      !selectedVideo ||
+      state.selectedContextType !== "video"
+    ) {
+      dispatch({ type: "notes_cleared" });
+      return;
+    }
+    let cancelled = false;
+    dispatch({ type: "notes_loading_started" });
+    loadVideoNotes(state.selectedSeriesId, state.selectedVideoId)
+      .then((notes) => {
+        if (!cancelled) {
+          dispatch({ type: "notes_loaded", notes });
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          dispatch({
+            type: "load_failed",
+            message: error instanceof Error ? error.message : "笔记加载失败",
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [dispatch, state.library, state.selectedSeriesId, state.selectedVideoId, state.selectedContextType]);
+}
+return useWorkspaceDataEffects;
+}

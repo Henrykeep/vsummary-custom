@@ -1,0 +1,223 @@
+"""生成层 Pydantic 载荷模型。
+
+定义 LLM 输出与制品之间互相转换所用的 DTO 形态：章节、整篇总结、
+思维导图节点、转写片段、转写增强结果。
+"""
+
+from __future__ import annotations
+
+from pydantic import BaseModel, Field, model_validator
+
+
+class SummaryChapterPayload(BaseModel):
+    """单章节总结的载荷模型。
+
+    Attributes:
+        id: 章节业务 ID，对应前端锚点定位。
+        title: 章节标题。
+        start_seconds: 章节起始时间（秒）。
+        end_seconds: 章节结束时间（秒）。
+        summary: 章节小结文本。
+        key_points: 章节要点列表。
+    """
+
+    id: str
+    title: str
+    start_seconds: float = Field(default=0.0, allow_inf_nan=False)
+    end_seconds: float = Field(default=0.0, allow_inf_nan=False)
+    summary: str = ""
+    key_points: list[str] = Field(default_factory=list)
+    image_timestamp_seconds: float | None = Field(default=None, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "SummaryChapterPayload":
+        if self.start_seconds < 0:
+            raise ValueError("章节 start_seconds 不能小于 0。")
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("章节 end_seconds 必须严格大于 start_seconds。")
+        if (
+            self.image_timestamp_seconds is not None
+            and not self.start_seconds <= self.image_timestamp_seconds <= self.end_seconds
+        ):
+            raise ValueError("章节 image_timestamp_seconds 必须位于章节时间范围内。")
+        return self
+
+
+class SummaryPayload(BaseModel):
+    """整篇视频总结的载荷模型。
+
+    Attributes:
+        title: 视频标题。
+        one_sentence_summary: 一句话总结。
+        core_problem: 视频核心要解决的问题。
+        chapters: 章节总结列表。
+        key_takeaways: 关键结论列表。
+    """
+
+    title: str
+    one_sentence_summary: str = ""
+    core_problem: str = ""
+    chapters: list[SummaryChapterPayload] = Field(default_factory=list)
+    key_takeaways: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_chapter_sequence(self) -> "SummaryPayload":
+        if len({chapter.id for chapter in self.chapters}) != len(self.chapters):
+            raise ValueError("章节 id 不能重复。")
+        for previous, current in zip(self.chapters, self.chapters[1:]):
+            if current.start_seconds < previous.end_seconds:
+                raise ValueError(
+                    f"章节必须按时间排序且互不重叠：{current.id} 的 start_seconds "
+                    f"({current.start_seconds}) 不能小于 {previous.id} 的 end_seconds ({previous.end_seconds})。"
+                )
+        return self
+
+
+class VisualEvidenceFramePayload(BaseModel):
+    """一张已抽取视频帧的可检索文字证据。"""
+
+    chapter_id: str = Field(min_length=1)
+    timestamp_seconds: float = Field(allow_inf_nan=False)
+    image_filename: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+
+
+class VisualEvidencePayload(BaseModel):
+    """一次多模态总结生成的逐帧视觉证据集合。"""
+
+    frames: list[VisualEvidenceFramePayload] = Field(default_factory=list)
+
+
+class MultimodalSummaryPayload(BaseModel):
+    """多模态最终化调用的结构化响应。"""
+
+    summary: SummaryPayload
+    visual_evidence: VisualEvidencePayload
+
+
+class MindmapNodePayload(BaseModel):
+    """思维导图节点的载荷模型（递归结构）。
+
+    Attributes:
+        id: 节点业务 ID。
+        title: 节点标题。
+        summary: 节点摘要文本。
+        start_seconds: 节点对应的时间起点（秒）；无时间锚点时为 0.0。
+        end_seconds: 节点对应的时间终点（秒）；无时间锚点时为 0.0。
+        children: 子节点列表。
+    """
+
+    id: str
+    title: str
+    summary: str = ""
+    start_seconds: float = Field(default=0.0)
+    end_seconds: float = Field(default=0.0)
+    children: list["MindmapNodePayload"] = Field(default_factory=list)
+
+
+class FlatMindmapNodePayload(BaseModel):
+    """非递归思维导图节点载荷。
+
+    ``parent_id`` 将节点组织关系从递归 ``children`` 移到平铺节点表中，
+    使本地模型服务可以使用不含循环引用的 JSON Schema 约束输出。
+    """
+
+    id: str = Field(min_length=1)
+    parent_id: str | None
+    title: str = Field(min_length=1)
+    summary: str = ""
+    start_seconds: float = Field(default=0.0)
+    end_seconds: float = Field(default=0.0)
+
+
+class FlatMindmapPayload(BaseModel):
+    """用于非递归 JSON Schema 的思维导图节点表。"""
+
+    nodes: list[FlatMindmapNodePayload] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_tree(self) -> "FlatMindmapPayload":
+        """验证节点关系确实能还原为一棵树，根节点通过 parent_id=None 推导。"""
+        node_by_id = {node.id: node for node in self.nodes}
+        if len(node_by_id) != len(self.nodes):
+            raise ValueError("思维导图节点 id 不能重复。")
+
+        # 找出所有根节点（parent_id 为 None）
+        root_nodes = [node for node in self.nodes if node.parent_id is None]
+        if len(root_nodes) == 0:
+            raise ValueError("至少需要一个根节点（parent_id 为 null）。")
+        if len(root_nodes) > 1:
+            raise ValueError("只能有一个根节点，但找到多个 parent_id 为 null 的节点。")
+
+        root = root_nodes[0]
+
+        # 验证所有非根节点都能连接到根节点
+        for node in self.nodes:
+            if node.id == root.id:
+                continue
+            if node.parent_id is None:
+                raise ValueError("只能有一个根节点（parent_id 为 null）。")
+            if node.parent_id not in node_by_id:
+                raise ValueError(f"节点 {node.id} 的 parent_id 不存在。")
+
+            path: set[str] = set()
+            current = node
+            while current.id != root.id:
+                if current.id in path:
+                    raise ValueError("思维导图节点不能形成父子环。")
+                path.add(current.id)
+                parent_id = current.parent_id
+                if parent_id is None:
+                    raise ValueError("所有非根节点必须连接到根节点。")
+                current = node_by_id[parent_id]
+
+        return self
+
+    def to_tree(self) -> MindmapNodePayload:
+        """将已验证的节点表转换为前端沿用的递归树结构。"""
+        node_by_id = {node.id: node for node in self.nodes}
+        children_by_parent: dict[str, list[FlatMindmapNodePayload]] = {
+            node.id: [] for node in self.nodes
+        }
+        for node in self.nodes:
+            if node.parent_id is not None:
+                children_by_parent[node.parent_id].append(node)
+
+        def build_node(node_id: str) -> MindmapNodePayload:
+            node = node_by_id[node_id]
+            return MindmapNodePayload(
+                id=node.id,
+                title=node.title,
+                summary=node.summary,
+                start_seconds=node.start_seconds,
+                end_seconds=node.end_seconds,
+                children=[build_node(child.id) for child in children_by_parent[node_id]],
+            )
+
+        # 找到根节点（parent_id 为 None）
+        root = next(node for node in self.nodes if node.parent_id is None)
+        return build_node(root.id)
+
+
+class TranscriptSegmentPayload(BaseModel):
+    """转写片段的载荷模型。
+
+    Attributes:
+        start_seconds: 片段起始时间（秒）。
+        end_seconds: 片段结束时间（秒）。
+        text: 片段文本。
+    """
+
+    start_seconds: float = Field(default=0.0)
+    end_seconds: float = Field(default=0.0)
+    text: str
+
+
+class TranscriptEnhancementPayload(BaseModel):
+    """转写增强结果的载荷模型。
+
+    Attributes:
+        segments: 增强后的转写片段列表。
+    """
+
+    segments: list[TranscriptSegmentPayload] = Field(default_factory=list)

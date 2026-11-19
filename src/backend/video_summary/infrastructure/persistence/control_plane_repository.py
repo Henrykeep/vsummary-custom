@@ -1,0 +1,444 @@
+"""MySQL 控制面 Repository。
+
+此模块只承载资源身份和持久任务提交，尚不接管现有文件工作区读取。所有任务
+创建、幂等键与 outbox 在同一个 MySQL 事务中提交。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, sessionmaker
+
+from backend.core.ids import new_ulid
+from backend.video_summary.infrastructure.persistence.execution_context import current_execution_claim, require_execution_lease
+from backend.video_summary.infrastructure.persistence.models import (
+    IdempotencyKey,
+    Job,
+    JobEvent,
+    Series,
+    Video,
+    Workspace,
+)
+
+
+class ControlPlaneConflictError(RuntimeError):
+    """幂等键或活跃任务与已持久化状态冲突。"""
+
+
+@dataclass(frozen=True)
+class SubmittedJob:
+    id: str
+    created: bool
+    status: str
+
+
+class SqlControlPlaneRepository:
+    """工作区资源与任务控制面 MySQL 实现。"""
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        self._session_factory = session_factory
+
+    def create_workspace(self, *, owner_scope_id: str, title: str) -> str:
+        _require_text(owner_scope_id, field_name="owner_scope_id")
+        _require_text(title, field_name="workspace title")
+        workspace_id = new_ulid()
+        with self._session_factory.begin() as session:
+            session.add(Workspace(id=workspace_id, owner_scope_id=owner_scope_id, title=title.strip()))
+        return workspace_id
+
+    def create_series(
+        self,
+        *,
+        workspace_id: str,
+        title: str,
+        position: int,
+        source_kind: str = "local",
+        storage_mode: str = "copy",
+        migration_run_id: str | None = None,
+        external_source_url: str | None = None,
+    ) -> str:
+        _require_text(workspace_id, field_name="workspace_id")
+        _require_text(title, field_name="series title")
+        if position < 0:
+            raise ValueError("Series position cannot be negative.")
+        series_id = new_ulid()
+        with self._session_factory.begin() as session:
+            session.add(
+                Series(
+                    id=series_id,
+                    workspace_id=workspace_id,
+                    title=title.strip(),
+                    position=position,
+                    source_kind=source_kind,
+                    storage_mode=storage_mode,
+                    migration_run_id=migration_run_id,
+                    import_published=migration_run_id is None,
+                    external_source_url=external_source_url,
+                )
+            )
+        return series_id
+
+    def create_series_at_next_position(
+        self,
+        *,
+        workspace_id: str,
+        title: str,
+        source_kind: str = "local",
+        storage_mode: str = "copy",
+        migration_run_id: str | None = None,
+        external_source_url: str | None = None,
+    ) -> str:
+        """Create a series after serializing position allocation for one workspace."""
+
+        _require_text(workspace_id, field_name="workspace_id")
+        _require_text(title, field_name="series title")
+        with self._session_factory.begin() as session:
+            self._lock_active_workspace(session, workspace_id)
+            series_id = self._add_series_at_next_position(
+                session,
+                workspace_id=workspace_id,
+                title=title,
+                source_kind=source_kind,
+                storage_mode=storage_mode,
+                migration_run_id=migration_run_id,
+                external_source_url=external_source_url,
+            )
+        return series_id
+
+    def ensure_playground_series(self, *, workspace_id: str) -> str:
+        """Return the workspace Playground, creating it while holding its lock."""
+
+        return self.ensure_series_by_source_kind(
+            workspace_id=workspace_id,
+            source_kind="playground",
+            title="Playground",
+        )
+
+    def ensure_series_by_source_kind(self, *, workspace_id: str, source_kind: str, title: str) -> str:
+        """Return a workspace-scoped special series, creating it under the workspace lock."""
+
+        _require_text(workspace_id, field_name="workspace_id")
+        _require_text(source_kind, field_name="source_kind")
+        _require_text(title, field_name="series title")
+        with self._session_factory.begin() as session:
+            self._lock_active_workspace(session, workspace_id)
+            existing_series_id = session.scalar(
+                select(Series.id)
+                .where(
+                    Series.workspace_id == workspace_id,
+                    Series.source_kind == source_kind,
+                    Series.deleted_at.is_(None),
+                )
+                .order_by(Series.position)
+                .with_for_update()
+            )
+            if existing_series_id is not None:
+                return existing_series_id
+            return self._add_series_at_next_position(
+                session,
+                workspace_id=workspace_id,
+                title=title,
+                source_kind=source_kind,
+            )
+
+    def create_series_at_preferred_position(
+        self,
+        *,
+        workspace_id: str,
+        title: str,
+        preferred_position: int,
+        source_kind: str = "local",
+        storage_mode: str = "copy",
+        migration_run_id: str | None = None,
+        external_source_url: str | None = None,
+    ) -> str:
+        """Create a series at its legacy position unless a historical row owns it."""
+
+        _require_text(workspace_id, field_name="workspace_id")
+        _require_text(title, field_name="series title")
+        if preferred_position < 0:
+            raise ValueError("Series position cannot be negative.")
+        series_id = new_ulid()
+        with self._session_factory.begin() as session:
+            workspace = session.get(Workspace, workspace_id, with_for_update=True)
+            if workspace is None or workspace.deleted_at is not None:
+                raise LookupError(f"workspace not found '{workspace_id}'")
+            position_taken = session.scalar(
+                select(Series.id).where(
+                    Series.workspace_id == workspace_id,
+                    Series.position == preferred_position,
+                )
+            )
+            position = preferred_position
+            if position_taken is not None:
+                position = int(
+                    session.scalar(
+                        select(func.coalesce(func.max(Series.position), -1) + 1).where(
+                            Series.workspace_id == workspace_id
+                        )
+                    )
+                )
+            session.add(
+                Series(
+                    id=series_id,
+                    workspace_id=workspace_id,
+                    title=title.strip(),
+                    position=position,
+                    source_kind=source_kind,
+                    storage_mode=storage_mode,
+                    migration_run_id=migration_run_id,
+                    import_published=migration_run_id is None,
+                    external_source_url=external_source_url,
+                )
+            )
+        return series_id
+
+    @staticmethod
+    def _lock_active_workspace(session: Session, workspace_id: str) -> None:
+        workspace = session.get(Workspace, workspace_id, with_for_update=True)
+        if workspace is None or workspace.deleted_at is not None:
+            raise LookupError(f"workspace not found '{workspace_id}'")
+
+    @staticmethod
+    def _add_series_at_next_position(
+        session: Session,
+        *,
+        workspace_id: str,
+        title: str,
+        source_kind: str,
+        storage_mode: str = "copy",
+        migration_run_id: str | None = None,
+        external_source_url: str | None = None,
+    ) -> str:
+        series_id = new_ulid()
+        position = int(
+            session.scalar(
+                select(func.coalesce(func.max(Series.position), -1) + 1).where(
+                    Series.workspace_id == workspace_id
+                )
+            )
+        )
+        session.add(
+            Series(
+                id=series_id,
+                workspace_id=workspace_id,
+                title=title.strip(),
+                position=position,
+                source_kind=source_kind,
+                storage_mode=storage_mode,
+                migration_run_id=migration_run_id,
+                import_published=migration_run_id is None,
+                external_source_url=external_source_url,
+            )
+        )
+        return series_id
+
+    def create_video(
+        self,
+        *,
+        series_id: str,
+        title: str,
+        source_kind: str,
+        external_source_id: str | None = None,
+        duration_ms: int | None = None,
+    ) -> str:
+        _require_text(series_id, field_name="series_id")
+        _require_text(title, field_name="video title")
+        _require_text(source_kind, field_name="source_kind")
+        if duration_ms is not None and duration_ms < 0:
+            raise ValueError("Video duration cannot be negative.")
+        video_id = new_ulid()
+        with self._session_factory.begin() as session:
+            session.add(
+                Video(
+                    id=video_id,
+                    series_id=series_id,
+                    title=title.strip(),
+                    source_kind=source_kind,
+                    external_source_id=external_source_id,
+                    duration_ms=duration_ms,
+                )
+            )
+        return video_id
+
+    def submit_job(
+        self,
+        *,
+        workspace_id: str,
+        resource_type: str,
+        resource_id: str,
+        operation: str,
+        request_payload: dict[str, Any],
+        active_key: str | None,
+        parent_job_id: str | None = None,
+        idempotency_scope_id: str | None = None,
+        idempotency_key: str | None = None,
+        idempotency_ttl: timedelta = timedelta(days=1),
+        job_id: str | None = None,
+    ) -> SubmittedJob:
+        _require_text(workspace_id, field_name="workspace_id")
+        _require_text(resource_type, field_name="resource_type")
+        _require_text(resource_id, field_name="resource_id")
+        _require_text(operation, field_name="operation")
+        if (idempotency_scope_id is None) != (idempotency_key is None):
+            raise ValueError("idempotency_scope_id and idempotency_key must be supplied together.")
+        request_hash = _request_hash(request_payload)
+        job_id = job_id or new_ulid()
+        try:
+            with self._session_factory.begin() as session:
+                claim = current_execution_claim()
+                if claim is not None:
+                    require_execution_lease(session, workspace_id)
+                existing = self._find_idempotent_job(
+                    session,
+                    scope_id=idempotency_scope_id,
+                    key=idempotency_key,
+                    request_hash=request_hash,
+                )
+                if existing is not None:
+                    return existing
+                if resource_type == 'video':
+                    series_id = session.scalar(select(Video.series_id).where(Video.id == resource_id))
+                    series = session.get(Series, series_id, with_for_update=True) if series_id is not None else None
+                    video = session.get(Video, resource_id, with_for_update=True)
+                    if (series is None or video is None or series.workspace_id != workspace_id
+                        or series.deleted_at is not None or video.deleted_at is not None):
+                        raise LookupError("video not found in workspace")
+                elif resource_type == 'series':
+                    series = session.get(Series, resource_id, with_for_update=True)
+                    if series is None or series.workspace_id != workspace_id or series.deleted_at is not None:
+                        raise LookupError("series not found in workspace")
+                if parent_job_id is not None:
+                    parent = session.scalar(select(Job).where(Job.id == parent_job_id).with_for_update())
+                    if parent is None or parent.workspace_id != workspace_id:
+                        raise ValueError("parent_job_id must reference a Job in the same Workspace.")
+                    if parent.cancel_requested_at is not None:
+                        raise ControlPlaneConflictError("Parent batch has been cancelled.")
+                job = Job(
+                    id=job_id,
+                    workspace_id=workspace_id,
+                    parent_job_id=parent_job_id,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    operation=operation,
+                    status="queued",
+                    request_payload=request_payload,
+                    actor_id=request_payload.get("_execution_context", {}).get("actor_id"),
+                    accounting_status="pending" if "_quota_reservation" in request_payload else "none",
+                    active_key=active_key,
+                )
+                session.add(job)
+                # IdempotencyKey has a direct FK to jobs but no ORM relationship.
+                # Flush now so MySQL always sees the parent row before the key row.
+                session.flush()
+                session.add(
+                    JobEvent(
+                        id=new_ulid(),
+                        job_id=job_id,
+                        sequence=1,
+                        stage="queued",
+                        progress=0.0,
+                        detail="任务已进入队列",
+                    )
+                )
+                if idempotency_scope_id is not None and idempotency_key is not None:
+                    session.add(
+                        IdempotencyKey(
+                            id=new_ulid(),
+                            scope_id=idempotency_scope_id,
+                            key=idempotency_key,
+                            request_hash=request_hash,
+                            job_id=job_id,
+                            expires_at=datetime.now(timezone.utc) + idempotency_ttl,
+                        )
+                    )
+            return SubmittedJob(id=job_id, created=True, status="queued")
+        except IntegrityError as error:
+            if parent_job_id is not None:
+                with self._session_factory() as session:
+                    child = session.scalar(select(Job).where(Job.parent_job_id == parent_job_id,
+                        Job.workspace_id == workspace_id, Job.resource_type == resource_type,
+                        Job.resource_id == resource_id, Job.operation == operation))
+                    if child is not None and _request_hash(child.request_payload) == request_hash:
+                        return SubmittedJob(id=child.id, created=False, status=child.status)
+            if idempotency_scope_id is not None:
+                existing = self._existing_idempotency_result(
+                    scope_id=idempotency_scope_id,
+                    key=idempotency_key,
+                    request_hash=request_hash,
+                )
+                if existing is not None:
+                    return existing
+                raise ControlPlaneConflictError("An idempotency key conflict occurred; retry the request.") from error
+            if active_key is not None:
+                raise ControlPlaneConflictError("An active job already exists for this resource.") from error
+            raise
+
+    @staticmethod
+    def _find_idempotent_job(
+        session: Session,
+        *,
+        scope_id: str | None,
+        key: str | None,
+        request_hash: str,
+    ) -> SubmittedJob | None:
+        if scope_id is None or key is None:
+            return None
+        record = session.scalar(
+            select(IdempotencyKey).where(IdempotencyKey.scope_id == scope_id, IdempotencyKey.key == key).with_for_update()
+        )
+        if record is None:
+            return None
+        if record.expires_at <= session.scalar(select(func.now())):
+            session.delete(record)
+            session.flush()
+            return None
+        if record.request_hash != request_hash:
+            raise ControlPlaneConflictError("Idempotency key was reused with a different request.")
+        job = session.get(Job, record.job_id)
+        if job is None:
+            raise RuntimeError("Idempotency record references a missing job.")
+        return SubmittedJob(id=job.id, created=False, status=job.status)
+
+    def _existing_idempotency_result(
+        self,
+        *,
+        scope_id: str,
+        key: str | None,
+        request_hash: str,
+    ) -> SubmittedJob | None:
+        if key is None:
+            return None
+        with self._session_factory() as session:
+            record = session.scalar(
+                select(IdempotencyKey).where(IdempotencyKey.scope_id == scope_id, IdempotencyKey.key == key)
+            )
+            if record is None or record.expires_at <= datetime.now(timezone.utc):
+                return None
+            if record.request_hash != request_hash:
+                raise ControlPlaneConflictError("Idempotency key was reused with a different request.")
+            job = session.get(Job, record.job_id)
+            if job is None:
+                raise RuntimeError("Idempotency record references a missing job.")
+            return SubmittedJob(id=job.id, created=False, status=job.status)
+
+
+def _request_hash(payload: dict[str, Any]) -> str:
+    try:
+        business_payload = {key: value for key, value in payload.items() if key not in {"_quota_reservation", "_execution_context", "_user_preferences", "_usage_estimate"}}
+        rendered = json.dumps(business_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as error:
+        raise ValueError("Job request payload must be JSON serializable.") from error
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def _require_text(value: str, *, field_name: str) -> None:
+    if not value or not value.strip():
+        raise ValueError(f"{field_name} is required.")

@@ -1,0 +1,1569 @@
+"""应用配置（settings.toml + .env）的加载、保存与字段校验。
+
+数据流：
+- `load_settings(config_path, root_dir)` → 读 `settings.toml` 并合并 `.env`
+  中的 secrets，构造不可变的 `AppSettings`；
+- `replace_*` 系列函数 → 用 `dataclasses.replace` 派生新 `AppSettings`，便于
+  按字段做 partial update；
+- `save_settings` / `save_env_settings` → 把更新后的 settings 落回 TOML / .env；
+- `apply_runtime_env_overrides` → 把 `.env` 中的 HuggingFace 镜像等环境变量
+  灌入 `os.environ`，供子进程与第三方 SDK 直接读取。
+
+所有常量都以业务命名（`DEFAULT_*`、`VALID_*`）暴露，便于设置页/校验逻辑复用。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+import json
+import math
+import os
+from pathlib import Path
+import shutil
+import sys
+import tomllib
+
+from backend.shared.llm.base_url import normalize_provider_base_url
+from backend.shared.filesystem import atomic_write_text
+from backend.core.preferences import VALID_ANSWER_DETAIL_LEVELS, VALID_AUTO_GENERATE_ARTIFACTS
+
+
+VALID_DEVICES = {"auto", "cpu", "gpu"}
+VALID_ASR_PROVIDERS = {"faster_whisper", "whisper_cpp", "aliyun_bailian"}
+VALID_THEMES = {"light", "dark", "system"}
+VALID_TRANSCRIPTION_MODES = {"fast", "balanced", "accurate"}
+VALID_PLANNER_TRANSPORTS = {"structured", "stream_buffered"}
+VALID_WEB_SEARCH_PROVIDERS = {"litellm"}
+VALID_WEB_SEARCH_MODES = {"native"}
+VALID_WEB_SEARCH_CONTEXT_SIZES = {"low", "medium", "high"}
+VALID_REASONING_EFFORTS = {"none", "low", "medium", "high"}
+VALID_CHAPTER_VISUAL_MODES = {"off", "screenshots", "multimodal"}
+VALID_NOTE_VISUAL_MODES = {"off", "screenshots"}
+VALID_VISUAL_INPUTS = {"none", "evidence", "frames"}
+VALID_LLM_PROVIDERS = {
+    "ai21",
+    "ai21_chat",
+    "aiohttp_openai",
+    "anthropic",
+    "anthropic_text",
+    "assemblyai",
+    "azure",
+    "azure_ai",
+    "azure_text",
+    "baseten",
+    "bedrock",
+    "cerebras",
+    "clarifai",
+    "cloudflare",
+    "codestral",
+    "cohere",
+    "cohere_chat",
+    "custom",
+    "custom_openai",
+    "databricks",
+    "datarobot",
+    "deepgram",
+    "deepinfra",
+    "deepseek",
+    "elevenlabs",
+    "empower",
+    "featherless_ai",
+    "fireworks_ai",
+    "friendliai",
+    "galadriel",
+    "gemini",
+    "github",
+    "github_copilot",
+    "groq",
+    "hosted_vllm",
+    "humanloop",
+    "huggingface",
+    "infinity",
+    "jina_ai",
+    "langfuse",
+    "litellm_proxy",
+    "lm_studio",
+    "maritalk",
+    "meta_llama",
+    "mistral",
+    "nebius",
+    "nlp_cloud",
+    "novita",
+    "nvidia_nim",
+    "nscale",
+    "ollama",
+    "oobabooga",
+    "openai",
+    "openrouter",
+    "perplexity",
+    "petals",
+    "predibase",
+    "replicate",
+    "sagemaker",
+    "sagemaker_chat",
+    "sambanova",
+    "snowflake",
+    "text-completion-codestral",
+    "text-completion-openai",
+    "together_ai",
+    "topaz",
+    "triton",
+    "vertex_ai",
+    "vertex_ai_beta",
+    "volcengine",
+    "voyage",
+    "watsonx",
+    "watsonx_text",
+    "xai",
+    "xinference",
+}
+DEFAULT_AGENT_CONTEXT_WINDOW_TOKENS = 1_000_000
+DEFAULT_AGENT_ANSWER_DETAIL_LEVEL = "medium"
+DEFAULT_AGENT_REASONING_EFFORT = "none"
+DEFAULT_AGENT_TALK_CUSTOM_PROMPT = ""
+DEFAULT_AGENT_RESERVED_OUTPUT_TOKENS = 20_000
+DEFAULT_AGENT_WARNING_THRESHOLD_RATIO = 0.60
+DEFAULT_AGENT_COMPACT_THRESHOLD_RATIO = 0.80
+DEFAULT_AGENT_BLOCKING_THRESHOLD_RATIO = 0.92
+DEFAULT_AGENT_KEEP_TAIL_MESSAGES = 6
+DEFAULT_AGENT_PROJECTION_MAX_TOKENS_RATIO = 0.08
+DEFAULT_AGENT_DIRECT_SUMMARY_THRESHOLD_RATIO = 0.90
+DEFAULT_AGENT_RETRIEVAL_EMBEDDING_PROVIDER = "fastembed"
+DEFAULT_AGENT_RETRIEVAL_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+DEFAULT_AGENT_RETRIEVAL_EMBEDDING_DEVICE = "cpu"
+DEFAULT_AGENT_RETRIEVAL_EMBEDDING_BATCH_SIZE = 8
+DEFAULT_AGENT_RETRIEVAL_MAX_HITS = 5
+DEFAULT_AGENT_RETRIEVAL_RERANK_ENABLED = True
+DEFAULT_VIDEO_GENERATION_CONCURRENCY = 1
+DEFAULT_SUMMARY_CHUNK_CONCURRENCY = 1
+DEFAULT_CHAPTER_VISUAL_MODE = "screenshots"
+DEFAULT_MAX_VISUAL_INPUT_IMAGES = 10
+DEFAULT_NOTE_VISUAL_MODE = "off"
+DEFAULT_AI_SUMMARY_MULTIMODAL_ENABLED = False
+DEFAULT_MINDMAP_VISUAL_INPUT = "none"
+DEFAULT_CARDS_VISUAL_INPUT = "none"
+DEFAULT_NOTE_MAX_IMAGES = 10
+DEFAULT_NOTE_IMAGE_MIN_GAP_SECONDS = 5.0
+DEFAULT_AUTO_GENERATE_ARTIFACTS: tuple[str, ...] = ()
+MAX_VISUAL_INPUT_IMAGES_LIMIT = 20
+DEFAULT_WEB_SEARCH_PROVIDER = "litellm"
+DEFAULT_WEB_SEARCH_MODE = "native"
+DEFAULT_WEB_SEARCH_CONTEXT_SIZE = "medium"
+DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
+DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS = 10
+DEFAULT_ASR_ALIYUN_BAILIAN_BASE_URL = "https://dashscope.aliyuncs.com"
+DEFAULT_ASR_ALIYUN_BAILIAN_MODEL = "paraformer-v2"
+DEFAULT_CHAOXING_REQUEST_DELAY_SECONDS = 0.2
+DEFAULT_CHAOXING_INIT_COURSE_DELAY_SECONDS = 0.3
+DEFAULT_BILIBILI_REQUEST_DELAY_SECONDS = 0.3
+DEFAULT_DOUYIN_REQUEST_DELAY_SECONDS = 1.0
+DEFAULT_ASR_LANGUAGE = "auto"
+DEFAULT_FASTER_WHISPER_INITIAL_PROMPT = ""
+DEFAULT_WHISPER_CPP_BINARY_PATH = "whisper-cli"
+DEFAULT_WHISPER_CPP_MODEL = "large-v3-turbo-q5_0"
+SUPPORTED_HUGGINGFACE_ENV_KEYS = ("HF_ENDPOINT", "HF_HOME", "HUGGINGFACE_HUB_CACHE")
+
+
+@dataclass(frozen=True)
+class FasterWhisperSettings:
+    """faster-whisper ASR provider 的子配置。
+
+    Attributes:
+        device: 设备标识，取值 `auto` / `cpu` / `gpu`。
+        model_size: 模型 ID（如 `small` / `large-v3-turbo`）。
+        compute_type: 计算精度（如 `int8` / `float16`）。
+        transcription_mode: 转写模式，决定 beam_size 等解码参数。
+        initial_prompt: 转写首段的上下文提示词，用于引导模型输出风格。
+        models_dir: faster-whisper 模型缓存根目录。
+    """
+
+    device: str
+    model_size: str
+    compute_type: str
+    transcription_mode: str
+    initial_prompt: str
+    models_dir: Path
+
+
+@dataclass(frozen=True)
+class AliyunBailianAsrSettings:
+    """阿里云百炼 ASR provider 的子配置。"""
+
+    base_url: str
+    model: str
+    api_key: str
+
+
+@dataclass(frozen=True)
+class WhisperCppSettings:
+    """whisper.cpp 外部命令行 provider 的配置。"""
+
+    binary_path: str
+    model: str
+    models_dir: Path
+
+
+@dataclass(frozen=True)
+class AsrSettings:
+    """ASR 总配置：provider + 语言 + 是否启用转写增强 + provider 子配置。
+
+    Attributes:
+        provider: ASR provider 标识。
+        language: 语言代码或 `auto`；`auto` 表示由 ASR 自动识别。
+        transcript_enhancement_enabled: 是否启用 LLM 转写增强。
+        faster_whisper: faster-whisper provider 的具体参数。
+        aliyun_bailian: 阿里云百炼 provider 的具体参数。
+    """
+
+    provider: str
+    language: str
+    transcript_enhancement_enabled: bool
+    faster_whisper: FasterWhisperSettings
+    whisper_cpp: WhisperCppSettings
+    aliyun_bailian: AliyunBailianAsrSettings
+
+
+@dataclass(frozen=True)
+class OpenAISettings:
+    """LLM 网关配置。
+
+    业务目的：固化 LiteLLM 调用所需的四元组（provider / base_url / model /
+    api_key），保证 secrets 仅来自 `.env`、不进入 `settings.toml`。
+    """
+
+    provider: str
+    base_url: str
+    model: str
+    api_key: str
+
+
+@dataclass(frozen=True)
+class WorkspaceUiSettings:
+    """工作区 UI 偏好配置（主题与关键结论展示）。
+
+    业务目的：保存用户在阅读面板上的可定制选项，与后端逻辑解耦。
+    """
+
+    theme: str
+    show_takeaways: bool
+
+
+@dataclass(frozen=True)
+class DebugSettings:
+    """调试模式开关。
+
+    业务目的：开启时 LangGraph 工作流会把 debug 日志追加到输出目录，方便
+    排查节点级行为。
+    """
+
+    mode: bool
+
+
+@dataclass(frozen=True)
+class AgentContextSettings:
+    """Agent 上下文与 LLM 行为相关参数。
+
+    Attributes:
+        window_tokens: 模型上下文窗口大小（token）。
+        answer_detail_level: 答案详细程度，取值 `short` / `medium` / `long`。
+        reasoning_effort: 推理深度，取值 `none` / `low` / `medium` / `high`。
+        talk_custom_prompt: 自定义问答系统提示词。
+        reserved_output_tokens: 为输出预留的 token 数。
+        warning_threshold_ratio / compact_threshold_ratio / blocking_threshold_ratio:
+            上下文预算告警/压缩/阻断三档阈值（占上下文比例）。
+        keep_tail_messages: 压缩时保留的最近消息条数。
+        projection_max_tokens_ratio: 投影预算占上下文窗口的比例。
+        direct_summary_threshold_ratio: 单视频总结走"直接总结"路径的预算阈值。
+        planner_transport: planner 与 executor 的传输模式，取值 `structured` /
+            `stream_buffered`，默认 `structured`。
+    """
+
+    window_tokens: int
+    answer_detail_level: str
+    reasoning_effort: str
+    talk_custom_prompt: str
+    reserved_output_tokens: int
+    warning_threshold_ratio: float
+    compact_threshold_ratio: float
+    blocking_threshold_ratio: float
+    keep_tail_messages: int
+    projection_max_tokens_ratio: float
+    direct_summary_threshold_ratio: float
+    planner_transport: str = "structured"
+
+
+@dataclass(frozen=True)
+class AgentRetrievalSettings:
+    """Agent RAG 检索相关参数。
+
+    Attributes:
+        embedding_provider: embedding 提供方（当前仅 `fastembed`）。
+        embedding_model: embedding 模型仓库 ID。
+        embedding_device: embedding 计算设备，取值 `auto` / `cpu` / `gpu`。
+        embedding_batch_size: 批处理大小。
+        max_hits: 单次检索返回的最大命中数。
+        rerank_enabled: 是否启用 BGE 重排序。
+    """
+
+    embedding_provider: str
+    embedding_model: str
+    embedding_device: str
+    embedding_batch_size: int
+    max_hits: int
+    rerank_enabled: bool
+    embedding_endpoint: str = ""
+    embedding_api_key: str = ""
+    embedding_dimensions: int | None = None
+    api_timeout_seconds: int = 60
+    rerank_provider: str = "fastembed"
+    rerank_endpoint: str = ""
+    rerank_model: str = ""
+    rerank_api_key: str = ""
+
+    def __post_init__(self):
+        from backend.video_summary.infrastructure.rag.agent_memory.api_models import ModelApiSettings
+        if self.embedding_provider == "openai_compatible":
+            if self.embedding_dimensions is None:
+                raise ValueError("API embedding requires embedding_dimensions.")
+            ModelApiSettings(self.embedding_endpoint, self.embedding_model, self.embedding_api_key,
+                self.api_timeout_seconds, self.embedding_dimensions)
+        if self.rerank_provider not in {"fastembed", "api"}:
+            raise ValueError("Unsupported agent_retrieval.rerank_provider.")
+        if self.rerank_enabled and self.rerank_provider == "api":
+            ModelApiSettings(self.rerank_endpoint, self.rerank_model, self.rerank_api_key, self.api_timeout_seconds)
+
+
+@dataclass(frozen=True)
+class GenerationConcurrencySettings:
+    """生成阶段的并发上限与章节截图配置。
+
+    Attributes:
+        video_generation_concurrency: 单视频级并发上限（系列批量时也会遵守）。
+        summary_chunk_concurrency: 单视频分片总结阶段的并发上限。
+        chapter_visual_mode: 章节画面策略，取值 `off` / `screenshots` / `multimodal`。
+    """
+
+    video_generation_concurrency: int
+    summary_chunk_concurrency: int
+    chapter_visual_mode: str
+    max_visual_input_images: int
+    note_visual_mode: str
+    ai_summary_multimodal_enabled: bool
+    mindmap_visual_input: str
+    cards_visual_input: str
+    note_max_images: int
+    note_image_min_gap_seconds: float
+    auto_generate_artifacts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WebSearchSettings:
+    """Web 搜索相关配置。
+
+    Attributes:
+        enabled: 是否启用 Web 搜索。
+        provider: 提供方（当前仅 `litellm`）。
+        mode: 搜索模式（`native` 等）。
+        search_context_size: 搜索上下文粒度（`low` / `medium` / `high`）。
+        max_results: 单次搜索返回的最大结果数。
+        timeout_seconds: 单次搜索的超时时间。
+    """
+
+    enabled: bool
+    provider: str
+    mode: str
+    search_context_size: str
+    max_results: int
+    timeout_seconds: int
+
+
+@dataclass(frozen=True)
+class ChaoxingImportSettings:
+    """超星导入相关节流配置。
+
+    Attributes:
+        request_delay_seconds: 普通请求之间的最小间隔（秒）。
+        init_course_delay_seconds: 课程初始化时的额外等待（秒）。
+    """
+
+    request_delay_seconds: float
+    init_course_delay_seconds: float
+
+
+@dataclass(frozen=True)
+class PlatformRequestSettings:
+    request_delay_seconds: float
+
+
+DOUYIN_SOURCES = ("f2", "ytdlp")
+
+
+@dataclass(frozen=True)
+class DouyinImportSettings:
+    """抖音导入配置。
+
+    Attributes:
+        request_delay_seconds: 请求之间的最小间隔（秒）。
+        source: 解析和下载后端：``f2``（默认，自带接口签名）或 ``ytdlp``。
+    """
+
+    request_delay_seconds: float
+    source: str = "f2"
+
+
+@dataclass(frozen=True)
+class ExternalImportSettings:
+    """外部平台导入和下载配置。"""
+
+    chaoxing: ChaoxingImportSettings
+    bilibili: PlatformRequestSettings
+    douyin: DouyinImportSettings
+
+
+@dataclass(frozen=True)
+class AppSettings:
+    """应用全局配置聚合根。
+
+    业务目的：把 asr / LLM / UI / agent 上下文与检索 / 生成 / 外部导入等所有
+    子配置装进一个不可变容器，作为运行时唯一可被注入的配置来源。
+    """
+
+    asr: AsrSettings
+    openai: OpenAISettings
+    workspace_ui: WorkspaceUiSettings
+    debug: DebugSettings
+    agent_context: AgentContextSettings
+    agent_retrieval: AgentRetrievalSettings
+    generation: GenerationConcurrencySettings
+    web_search: WebSearchSettings
+    external_import: ExternalImportSettings
+
+
+def load_settings(config_path: Path, root_dir: Path) -> AppSettings:
+    """加载 `settings.toml` 并合并 `.env` 中的 secrets，构造 `AppSettings`。
+
+    关键行为：
+    - 对所有枚举字段做白名单校验，非法值抛 `ValueError`；
+    - 对数字字段做范围/正整数校验；
+    - 把 `OPENAI_*` 字段用 `load_env_settings` 的结果覆盖，保证 secrets 不进 TOML。
+
+    Args:
+        config_path: `settings.toml` 路径。
+        root_dir: 项目根目录，用于解析模型缓存路径与 `.env`。
+
+    Returns:
+        已校验的 `AppSettings` 不可变实例。
+    """
+    ensure_settings_file(config_path)
+    payload = _load_settings_payload(config_path)
+    env_values = load_env_settings(root_dir)
+
+    asr_payload = payload["asr"]
+    provider = asr_payload["provider"].lower()
+    if provider not in VALID_ASR_PROVIDERS:
+        raise ValueError(f"Unsupported asr.provider: {provider}")
+
+    faster_payload = asr_payload["faster_whisper"]
+    faster_device = _normalize_device(
+        faster_payload.get("device"),
+        field_name="faster_whisper.device",
+        default="auto",
+    )
+
+    faster_settings = FasterWhisperSettings(
+        device=faster_device,
+        model_size=faster_payload["model_size"],
+        compute_type=faster_payload["compute_type"],
+        transcription_mode=_normalize_transcription_mode(faster_payload.get("transcription_mode")),
+        initial_prompt=_normalize_string(
+            faster_payload.get("initial_prompt"),
+            default=DEFAULT_FASTER_WHISPER_INITIAL_PROMPT,
+        ),
+        models_dir=root_dir / "data" / "models" / "faster-whisper",
+    )
+    whisper_cpp_payload = asr_payload.get("whisper_cpp", {})
+    whisper_cpp_settings = WhisperCppSettings(
+        binary_path=_normalize_string(
+            whisper_cpp_payload.get("binary_path"),
+            default=DEFAULT_WHISPER_CPP_BINARY_PATH,
+        ),
+        model=_normalize_string(
+            whisper_cpp_payload.get("model"),
+            default=DEFAULT_WHISPER_CPP_MODEL,
+        ),
+        models_dir=root_dir / "data" / "models" / "whisper-cpp",
+    )
+    aliyun_payload = asr_payload.get("aliyun_bailian", {})
+    aliyun_settings = AliyunBailianAsrSettings(
+        base_url=_normalize_http_base_url(
+            aliyun_payload.get("base_url"),
+            default=DEFAULT_ASR_ALIYUN_BAILIAN_BASE_URL,
+            field_name="asr.aliyun_bailian.base_url",
+        ),
+        model=_normalize_string(
+            aliyun_payload.get("model"),
+            default=DEFAULT_ASR_ALIYUN_BAILIAN_MODEL,
+        ),
+        api_key=env_values.dashscope_api_key,
+    )
+
+    asr_settings = AsrSettings(
+        provider=provider,
+        language=_normalize_asr_language(asr_payload.get("language")),
+        transcript_enhancement_enabled=bool(asr_payload.get("transcript_enhancement_enabled", True)),
+        faster_whisper=faster_settings,
+        whisper_cpp=whisper_cpp_settings,
+        aliyun_bailian=aliyun_settings,
+    )
+
+    openai_settings = OpenAISettings(
+        provider=env_values.provider,
+        base_url=normalize_openai_base_url(env_values.base_url),
+        model=env_values.model,
+        api_key=env_values.api_key,
+    )
+
+    workspace_ui_payload = payload.get("workspace_ui", {})
+    workspace_ui_settings = WorkspaceUiSettings(
+        theme=_normalize_theme(workspace_ui_payload.get("theme")),
+        show_takeaways=bool(workspace_ui_payload.get("show_takeaways", True)),
+    )
+    debug_payload = payload.get("debug", {})
+    debug_settings = DebugSettings(
+        mode=bool(debug_payload.get("mode", False)),
+    )
+    agent_context_payload = payload.get("agent_context", {})
+    agent_context_advanced_payload = agent_context_payload.get("advanced", {})
+    agent_context_settings = AgentContextSettings(
+        window_tokens=_normalize_positive_int(
+            agent_context_payload.get("window_tokens"),
+            default=DEFAULT_AGENT_CONTEXT_WINDOW_TOKENS,
+        ),
+        answer_detail_level=_normalize_choice(
+            agent_context_payload.get("answer_detail_level"),
+            default=DEFAULT_AGENT_ANSWER_DETAIL_LEVEL,
+            allowed=VALID_ANSWER_DETAIL_LEVELS,
+            field_name="agent_context.answer_detail_level",
+        ),
+        reasoning_effort=_normalize_choice(
+            agent_context_payload.get("reasoning_effort"),
+            default=DEFAULT_AGENT_REASONING_EFFORT,
+            allowed=VALID_REASONING_EFFORTS,
+            field_name="agent_context.reasoning_effort",
+        ),
+        talk_custom_prompt=_normalize_string(
+            agent_context_payload.get("talk_custom_prompt"),
+            default=DEFAULT_AGENT_TALK_CUSTOM_PROMPT,
+        ),
+        reserved_output_tokens=_normalize_positive_int(
+            agent_context_advanced_payload.get("reserved_output_tokens"),
+            default=DEFAULT_AGENT_RESERVED_OUTPUT_TOKENS,
+        ),
+        warning_threshold_ratio=_normalize_ratio(
+            agent_context_advanced_payload.get("warning_threshold_ratio"),
+            default=DEFAULT_AGENT_WARNING_THRESHOLD_RATIO,
+        ),
+        compact_threshold_ratio=_normalize_ratio(
+            agent_context_advanced_payload.get("compact_threshold_ratio"),
+            default=DEFAULT_AGENT_COMPACT_THRESHOLD_RATIO,
+        ),
+        blocking_threshold_ratio=_normalize_ratio(
+            agent_context_advanced_payload.get("blocking_threshold_ratio"),
+            default=DEFAULT_AGENT_BLOCKING_THRESHOLD_RATIO,
+        ),
+        keep_tail_messages=_normalize_positive_int(
+            agent_context_advanced_payload.get("keep_tail_messages"),
+            default=DEFAULT_AGENT_KEEP_TAIL_MESSAGES,
+        ),
+        projection_max_tokens_ratio=_normalize_ratio(
+            agent_context_advanced_payload.get("projection_max_tokens_ratio"),
+            default=DEFAULT_AGENT_PROJECTION_MAX_TOKENS_RATIO,
+        ),
+        direct_summary_threshold_ratio=_normalize_ratio(
+            agent_context_advanced_payload.get("direct_summary_threshold_ratio"),
+            default=DEFAULT_AGENT_DIRECT_SUMMARY_THRESHOLD_RATIO,
+        ),
+        planner_transport=_normalize_planner_transport(
+            agent_context_advanced_payload.get("planner_transport")
+        ),
+    )
+    agent_retrieval_payload = payload.get("agent_retrieval", {})
+    rag_secrets = _load_dotenv(root_dir / ".env")
+    agent_retrieval_settings = AgentRetrievalSettings(
+        embedding_provider=_normalize_embedding_provider(
+            agent_retrieval_payload.get("embedding_provider")
+        ),
+        embedding_model=_normalize_non_empty_string(
+            agent_retrieval_payload.get("embedding_model"),
+            default=DEFAULT_AGENT_RETRIEVAL_EMBEDDING_MODEL,
+        ),
+        embedding_device=_normalize_device(
+            agent_retrieval_payload.get("embedding_device"),
+            field_name="agent_retrieval.embedding_device",
+            default=DEFAULT_AGENT_RETRIEVAL_EMBEDDING_DEVICE,
+        ),
+        embedding_batch_size=_normalize_positive_int(
+            agent_retrieval_payload.get("embedding_batch_size"),
+            default=DEFAULT_AGENT_RETRIEVAL_EMBEDDING_BATCH_SIZE,
+        ),
+        max_hits=_normalize_positive_int(
+            agent_retrieval_payload.get("max_hits"),
+            default=DEFAULT_AGENT_RETRIEVAL_MAX_HITS,
+            field_name="agent_retrieval.max_hits",
+        ),
+        rerank_enabled=bool(
+            agent_retrieval_payload.get("rerank_enabled", DEFAULT_AGENT_RETRIEVAL_RERANK_ENABLED)
+        ),
+        embedding_endpoint=str(agent_retrieval_payload.get("embedding_endpoint", "")).strip(),
+        embedding_api_key=rag_secrets.get("EMBEDDING_API_KEY", os.environ.get("EMBEDDING_API_KEY", "")).strip(),
+        embedding_dimensions=_normalize_positive_int(agent_retrieval_payload["embedding_dimensions"], default=1, field_name="embedding_dimensions") if "embedding_dimensions" in agent_retrieval_payload else None,
+        api_timeout_seconds=_normalize_positive_int(agent_retrieval_payload.get("api_timeout_seconds"), default=60, field_name="api_timeout_seconds"),
+        rerank_provider=str(agent_retrieval_payload.get("rerank_provider", "fastembed")).strip(),
+        rerank_endpoint=str(agent_retrieval_payload.get("rerank_endpoint", "")).strip(),
+        rerank_model=str(agent_retrieval_payload.get("rerank_model", "")).strip(),
+        rerank_api_key=rag_secrets.get("RERANK_API_KEY", os.environ.get("RERANK_API_KEY", "")).strip(),
+    )
+    generation_payload = payload.get("generation", {})
+    generation_settings = GenerationConcurrencySettings(
+        video_generation_concurrency=_normalize_positive_int(
+            generation_payload.get("video_generation_concurrency"),
+            default=DEFAULT_VIDEO_GENERATION_CONCURRENCY,
+            field_name="generation.video_generation_concurrency",
+        ),
+        summary_chunk_concurrency=_normalize_positive_int(
+            generation_payload.get("summary_chunk_concurrency"),
+            default=DEFAULT_SUMMARY_CHUNK_CONCURRENCY,
+            field_name="generation.summary_chunk_concurrency",
+        ),
+        chapter_visual_mode=_normalize_choice(
+            generation_payload.get("chapter_visual_mode"),
+            default=DEFAULT_CHAPTER_VISUAL_MODE,
+            allowed=VALID_CHAPTER_VISUAL_MODES,
+            field_name="generation.chapter_visual_mode",
+        ),
+        max_visual_input_images=_normalize_positive_int(
+            generation_payload.get("max_visual_input_images"),
+            default=DEFAULT_MAX_VISUAL_INPUT_IMAGES,
+            field_name="generation.max_visual_input_images",
+        ),
+        note_visual_mode=_normalize_choice(
+            generation_payload.get("note_visual_mode"),
+            default=DEFAULT_NOTE_VISUAL_MODE,
+            allowed=VALID_NOTE_VISUAL_MODES,
+            field_name="generation.note_visual_mode",
+        ),
+        ai_summary_multimodal_enabled=bool(
+            generation_payload.get("ai_summary_multimodal_enabled", DEFAULT_AI_SUMMARY_MULTIMODAL_ENABLED)
+        ),
+        mindmap_visual_input=_normalize_choice(
+            generation_payload.get("mindmap_visual_input"),
+            default=DEFAULT_MINDMAP_VISUAL_INPUT,
+            allowed=VALID_VISUAL_INPUTS,
+            field_name="generation.mindmap_visual_input",
+        ),
+        cards_visual_input=_normalize_choice(
+            generation_payload.get("cards_visual_input"),
+            default=DEFAULT_CARDS_VISUAL_INPUT,
+            allowed=VALID_VISUAL_INPUTS,
+            field_name="generation.cards_visual_input",
+        ),
+        note_max_images=_normalize_positive_int(
+            generation_payload.get("note_max_images"),
+            default=DEFAULT_NOTE_MAX_IMAGES,
+            field_name="generation.note_max_images",
+        ),
+        note_image_min_gap_seconds=_normalize_non_negative_float(
+            generation_payload.get("note_image_min_gap_seconds"),
+            default=DEFAULT_NOTE_IMAGE_MIN_GAP_SECONDS,
+            field_name="generation.note_image_min_gap_seconds",
+        ),
+        auto_generate_artifacts=_normalize_auto_generate_artifacts(
+            generation_payload.get("auto_generate_artifacts"),
+        ),
+    )
+    if generation_settings.max_visual_input_images > MAX_VISUAL_INPUT_IMAGES_LIMIT:
+        raise ValueError(f"generation.max_visual_input_images 不能大于 {MAX_VISUAL_INPUT_IMAGES_LIMIT}。")
+    web_search_payload = payload.get("web_search", {})
+    web_search_settings = WebSearchSettings(
+        enabled=bool(web_search_payload.get("enabled", False)),
+        provider=_normalize_choice(
+            web_search_payload.get("provider"),
+            default=DEFAULT_WEB_SEARCH_PROVIDER,
+            allowed=VALID_WEB_SEARCH_PROVIDERS,
+            field_name="web_search.provider",
+        ),
+        mode=_normalize_choice(
+            web_search_payload.get("mode"),
+            default=DEFAULT_WEB_SEARCH_MODE,
+            allowed=VALID_WEB_SEARCH_MODES,
+            field_name="web_search.mode",
+        ),
+        search_context_size=_normalize_choice(
+            web_search_payload.get("search_context_size"),
+            default=DEFAULT_WEB_SEARCH_CONTEXT_SIZE,
+            allowed=VALID_WEB_SEARCH_CONTEXT_SIZES,
+            field_name="web_search.search_context_size",
+        ),
+        max_results=_normalize_positive_int(
+            web_search_payload.get("max_results"),
+            default=DEFAULT_WEB_SEARCH_MAX_RESULTS,
+            field_name="web_search.max_results",
+        ),
+        timeout_seconds=_normalize_positive_int(
+            web_search_payload.get("timeout_seconds"),
+            default=DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
+            field_name="web_search.timeout_seconds",
+        ),
+    )
+    external_import_payload = payload.get("external_import", {})
+    chaoxing_import_payload = external_import_payload.get("chaoxing", {})
+    external_import_settings = ExternalImportSettings(
+        bilibili=PlatformRequestSettings(request_delay_seconds=_normalize_non_negative_float(
+            external_import_payload.get("bilibili", {}).get("request_delay_seconds"),
+            default=DEFAULT_BILIBILI_REQUEST_DELAY_SECONDS,
+            field_name="external_import.bilibili.request_delay_seconds")),
+        douyin=DouyinImportSettings(request_delay_seconds=_normalize_non_negative_float(
+            external_import_payload.get("douyin", {}).get("request_delay_seconds"),
+            default=DEFAULT_DOUYIN_REQUEST_DELAY_SECONDS,
+            field_name="external_import.douyin.request_delay_seconds"),
+            source=_normalize_douyin_source(external_import_payload.get("douyin", {}).get("source"))),
+        chaoxing=ChaoxingImportSettings(
+            request_delay_seconds=_normalize_non_negative_float(
+                chaoxing_import_payload.get("request_delay_seconds"),
+                default=DEFAULT_CHAOXING_REQUEST_DELAY_SECONDS,
+                field_name="external_import.chaoxing.request_delay_seconds",
+            ),
+            init_course_delay_seconds=_normalize_non_negative_float(
+                chaoxing_import_payload.get("init_course_delay_seconds"),
+                default=DEFAULT_CHAOXING_INIT_COURSE_DELAY_SECONDS,
+                field_name="external_import.chaoxing.init_course_delay_seconds",
+            ),
+        ),
+    )
+
+    return AppSettings(
+        asr=asr_settings,
+        openai=openai_settings,
+        workspace_ui=workspace_ui_settings,
+        debug=debug_settings,
+        agent_context=agent_context_settings,
+        agent_retrieval=agent_retrieval_settings,
+        generation=generation_settings,
+        web_search=web_search_settings,
+        external_import=external_import_settings,
+    )
+
+
+def save_settings(config_path: Path, settings: AppSettings) -> None:
+    """把 `AppSettings` 序列化回 `settings.toml`（走原子写）。"""
+    atomic_write_text(config_path, _render_settings_toml(settings))
+
+
+def ensure_settings_file(config_path: Path) -> None:
+    if config_path.exists():
+        return
+    example_path = config_path.with_name(f"{config_path.name}.example")
+    if not example_path.exists():
+        raise FileNotFoundError(f"settings file not found: {config_path}")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "darwin":
+        template = example_path.read_text(encoding="utf-8")
+        template = template.replace('provider = "faster_whisper"', 'provider = "whisper_cpp"', 1)
+        template = template.replace('device = "gpu"', 'device = "cpu"')
+        template = template.replace('compute_type = "float16"', 'compute_type = "int8"')
+        atomic_write_text(config_path, template)
+    else:
+        shutil.copyfile(example_path, config_path)
+
+
+def _load_settings_payload(config_path: Path) -> dict[str, object]:
+    """Load user settings over the current template without overwriting user files.
+
+    A release can add new settings after a user already has ``settings.toml``.
+    The example file is the product-owned default source for those missing
+    fields; the user's explicit values always win. We deliberately do not
+    rewrite the file here, so comments and any future host-owned TOML fields
+    remain intact until an explicit settings save occurs.
+    """
+
+    user_payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    example_path = config_path.with_name(f"{config_path.name}.example")
+    if not example_path.exists():
+        return user_payload
+    template_payload = tomllib.loads(example_path.read_text(encoding="utf-8"))
+    return _merge_settings_payload(template_payload, user_payload)
+
+
+def _merge_settings_payload(template: dict[str, object], user: dict[str, object]) -> dict[str, object]:
+    """Recursively overlay user TOML values onto template defaults."""
+
+    merged: dict[str, object] = dict(template)
+    for key, user_value in user.items():
+        template_value = merged.get(key)
+        if isinstance(template_value, dict) and isinstance(user_value, dict):
+            merged[key] = _merge_settings_payload(template_value, user_value)
+        else:
+            merged[key] = user_value
+    return merged
+
+
+def replace_workspace_ui_settings(settings: AppSettings, workspace_ui: WorkspaceUiSettings) -> AppSettings:
+    """派生仅替换 `workspace_ui` 字段的新 `AppSettings`。"""
+    return replace(settings, workspace_ui=workspace_ui)
+
+
+def replace_asr_provider(settings: AppSettings, provider: str) -> AppSettings:
+    """派生替换 ASR provider（已校验枚举）。"""
+    normalized_provider = provider.strip().lower()
+    if normalized_provider not in VALID_ASR_PROVIDERS:
+        raise ValueError(f"Unsupported asr.provider: {normalized_provider}")
+    return replace(settings, asr=replace(settings.asr, provider=normalized_provider))
+
+
+def replace_aliyun_bailian_asr_settings(
+    settings: AppSettings,
+    *,
+    base_url: str,
+    model: str,
+) -> AppSettings:
+    """派生替换阿里云百炼 ASR 配置。"""
+    return replace(
+        settings,
+        asr=replace(
+            settings.asr,
+            aliyun_bailian=AliyunBailianAsrSettings(
+                base_url=_normalize_http_base_url(
+                    base_url,
+                    default=DEFAULT_ASR_ALIYUN_BAILIAN_BASE_URL,
+                    field_name="asr.aliyun_bailian.base_url",
+                ),
+                model=_normalize_string(model, default=DEFAULT_ASR_ALIYUN_BAILIAN_MODEL),
+                api_key=settings.asr.aliyun_bailian.api_key,
+            ),
+        ),
+    )
+
+
+def replace_faster_whisper_model_size(settings: AppSettings, model_size: str) -> AppSettings:
+    """派生仅替换 faster-whisper 模型 ID 的新 `AppSettings`。"""
+    return replace(
+        settings,
+        asr=replace(
+            settings.asr,
+            faster_whisper=replace(settings.asr.faster_whisper, model_size=model_size),
+        ),
+    )
+
+
+def replace_whisper_cpp_model(settings: AppSettings, model: str) -> AppSettings:
+    """派生替换 whisper.cpp 当前模型。"""
+    return replace(
+        settings,
+        asr=replace(settings.asr, whisper_cpp=replace(settings.asr.whisper_cpp, model=model)),
+    )
+
+
+def replace_transcript_enhancement_enabled(settings: AppSettings, transcript_enhancement_enabled: bool) -> AppSettings:
+    """派生仅替换"是否启用转写增强"的新 `AppSettings`。"""
+    return replace(settings, asr=replace(settings.asr, transcript_enhancement_enabled=transcript_enhancement_enabled))
+
+
+def replace_faster_whisper_transcription_mode(settings: AppSettings, transcription_mode: str) -> AppSettings:
+    """派生仅替换转写模式（已校验）的 `AppSettings`。"""
+    normalized_mode = _normalize_transcription_mode(transcription_mode)
+    return replace(
+        settings,
+        asr=replace(
+            settings.asr,
+            faster_whisper=replace(settings.asr.faster_whisper, transcription_mode=normalized_mode),
+        ),
+    )
+
+
+def replace_agent_retrieval_embedding_device(settings: AppSettings, embedding_device: str) -> AppSettings:
+    """派生仅替换 RAG embedding 设备（已归一化）的 `AppSettings`。"""
+    normalized_device = _normalize_device(
+        embedding_device,
+        field_name="agent_retrieval.embedding_device",
+        default=DEFAULT_AGENT_RETRIEVAL_EMBEDDING_DEVICE,
+    )
+    return replace(
+        settings,
+        agent_retrieval=replace(
+            settings.agent_retrieval,
+            embedding_device=normalized_device,
+        ),
+    )
+
+
+def replace_agent_retrieval_runtime_settings(
+    settings: AppSettings,
+    *,
+    embedding_device: str,
+    max_hits: int,
+    rerank_enabled: bool,
+) -> AppSettings:
+    """派生替换 RAG 运行时三件套（设备 / max_hits / rerank）的 `AppSettings`。"""
+    normalized_device = _normalize_device(
+        embedding_device,
+        field_name="agent_retrieval.embedding_device",
+        default=DEFAULT_AGENT_RETRIEVAL_EMBEDDING_DEVICE,
+    )
+    normalized_max_hits = _normalize_positive_int(
+        max_hits,
+        default=DEFAULT_AGENT_RETRIEVAL_MAX_HITS,
+        field_name="agent_retrieval.max_hits",
+    )
+    return replace(
+        settings,
+        agent_retrieval=replace(
+            settings.agent_retrieval,
+            embedding_device=normalized_device,
+            max_hits=normalized_max_hits,
+            rerank_enabled=bool(rerank_enabled),
+        ),
+    )
+
+
+def replace_agent_context_window_tokens(settings: AppSettings, window_tokens: int) -> AppSettings:
+    """派生替换 LLM 上下文窗口大小（已校验正整数）的 `AppSettings`。"""
+    normalized_window_tokens = _normalize_positive_int(
+        window_tokens,
+        default=DEFAULT_AGENT_CONTEXT_WINDOW_TOKENS,
+    )
+    return replace(
+        settings,
+        agent_context=replace(
+            settings.agent_context,
+            window_tokens=normalized_window_tokens,
+        ),
+    )
+
+
+def replace_agent_context_answer_detail_level(settings: AppSettings, answer_detail_level: str) -> AppSettings:
+    """派生替换答案详细程度（已校验枚举）的 `AppSettings`。"""
+    normalized_answer_detail_level = _normalize_choice(
+        answer_detail_level,
+        default=DEFAULT_AGENT_ANSWER_DETAIL_LEVEL,
+        allowed=VALID_ANSWER_DETAIL_LEVELS,
+        field_name="agent_context.answer_detail_level",
+    )
+    return replace(
+        settings,
+        agent_context=replace(
+            settings.agent_context,
+            answer_detail_level=normalized_answer_detail_level,
+        ),
+    )
+
+
+def replace_agent_context_reasoning_effort(settings: AppSettings, reasoning_effort: str) -> AppSettings:
+    """派生替换推理深度（已校验枚举）的 `AppSettings`。"""
+    normalized_reasoning_effort = _normalize_choice(
+        reasoning_effort,
+        default=DEFAULT_AGENT_REASONING_EFFORT,
+        allowed=VALID_REASONING_EFFORTS,
+        field_name="agent_context.reasoning_effort",
+    )
+    return replace(
+        settings,
+        agent_context=replace(
+            settings.agent_context,
+            reasoning_effort=normalized_reasoning_effort,
+        ),
+    )
+
+
+def replace_agent_context_talk_custom_prompt(settings: AppSettings, talk_custom_prompt: str) -> AppSettings:
+    """派生替换 Agent 自定义问答提示词的 `AppSettings`。"""
+    return replace(
+        settings,
+        agent_context=replace(
+            settings.agent_context,
+            talk_custom_prompt=_normalize_string(
+                talk_custom_prompt,
+                default=DEFAULT_AGENT_TALK_CUSTOM_PROMPT,
+            ),
+        ),
+    )
+
+
+def replace_video_generation_concurrency(settings: AppSettings, video_generation_concurrency: int) -> AppSettings:
+    """派生替换单视频级并发上限（已校验正整数）的 `AppSettings`。"""
+    normalized_concurrency = _normalize_positive_int(
+        video_generation_concurrency,
+        default=DEFAULT_VIDEO_GENERATION_CONCURRENCY,
+        field_name="generation.video_generation_concurrency",
+    )
+    return replace(
+        settings,
+        generation=replace(
+            settings.generation,
+            video_generation_concurrency=normalized_concurrency,
+        ),
+    )
+
+
+def replace_chapter_visual_settings(
+    settings: AppSettings,
+    *,
+    chapter_visual_mode: str,
+    max_visual_input_images: int,
+) -> AppSettings:
+    """派生替换章节画面策略与单视频图片上限。"""
+    mode = _normalize_choice(
+        chapter_visual_mode,
+        default=DEFAULT_CHAPTER_VISUAL_MODE,
+        allowed=VALID_CHAPTER_VISUAL_MODES,
+        field_name="generation.chapter_visual_mode",
+    )
+    normalized_limit = _normalize_positive_int(
+        max_visual_input_images,
+        default=DEFAULT_MAX_VISUAL_INPUT_IMAGES,
+        field_name="generation.max_visual_input_images",
+    )
+    if normalized_limit > MAX_VISUAL_INPUT_IMAGES_LIMIT:
+        raise ValueError(f"generation.max_visual_input_images 不能大于 {MAX_VISUAL_INPUT_IMAGES_LIMIT}。")
+    return replace(
+        settings,
+        generation=replace(
+            settings.generation,
+            chapter_visual_mode=mode,
+            max_visual_input_images=normalized_limit,
+        ),
+    )
+
+
+def replace_downstream_visual_settings(
+    settings: AppSettings,
+    *,
+    note_visual_mode: str,
+    ai_summary_multimodal_enabled: bool,
+    mindmap_visual_input: str,
+    cards_visual_input: str,
+    note_max_images: int,
+    note_image_min_gap_seconds: float,
+) -> AppSettings:
+    """派生替换笔记及下游产物的视觉消费策略。"""
+    if note_max_images <= 0:
+        raise ValueError("generation.note_max_images 必须是大于 0 的整数。")
+    if note_image_min_gap_seconds < 0:
+        raise ValueError("generation.note_image_min_gap_seconds 必须是大于等于 0 的数字。")
+    return replace(
+        settings,
+        generation=replace(
+            settings.generation,
+            note_visual_mode=_normalize_choice(
+                note_visual_mode,
+                default=DEFAULT_NOTE_VISUAL_MODE,
+                allowed=VALID_NOTE_VISUAL_MODES,
+                field_name="generation.note_visual_mode",
+            ),
+            ai_summary_multimodal_enabled=bool(ai_summary_multimodal_enabled),
+            mindmap_visual_input=_normalize_choice(
+                mindmap_visual_input,
+                default=DEFAULT_MINDMAP_VISUAL_INPUT,
+                allowed=VALID_VISUAL_INPUTS,
+                field_name="generation.mindmap_visual_input",
+            ),
+            cards_visual_input=_normalize_choice(
+                cards_visual_input,
+                default=DEFAULT_CARDS_VISUAL_INPUT,
+                allowed=VALID_VISUAL_INPUTS,
+                field_name="generation.cards_visual_input",
+            ),
+            note_max_images=note_max_images,
+            note_image_min_gap_seconds=float(note_image_min_gap_seconds),
+        ),
+    )
+
+
+def replace_auto_generate_artifacts(settings: AppSettings, artifacts: object) -> AppSettings:
+    """派生替换 AI 概况完成后自动生成的制品集合。"""
+    return replace(
+        settings,
+        generation=replace(settings.generation, auto_generate_artifacts=_normalize_auto_generate_artifacts(artifacts)),
+    )
+
+
+def replace_web_search_enabled(settings: AppSettings, web_search_enabled: bool) -> AppSettings:
+    """派生替换 Web 搜索启用开关的 `AppSettings`。"""
+    return replace(
+        settings,
+        web_search=replace(settings.web_search, enabled=bool(web_search_enabled)),
+    )
+
+
+def _normalize_douyin_source(value: object) -> str:
+    if value is None:
+        return "f2"
+    source = str(value).strip().lower().replace("-", "")
+    if source not in DOUYIN_SOURCES:
+        raise ValueError(f"external_import.douyin.source 必须是 {' 或 '.join(DOUYIN_SOURCES)}。")
+    return source
+
+
+def replace_chaoxing_import_settings(
+    settings: AppSettings,
+    *,
+    request_delay_seconds: float,
+    init_course_delay_seconds: float,
+) -> AppSettings:
+    """派生替换超星导入节流参数的 `AppSettings`。"""
+    return replace(
+        settings,
+        external_import=replace(
+            settings.external_import,
+            chaoxing=ChaoxingImportSettings(
+                request_delay_seconds=_normalize_non_negative_float(
+                    request_delay_seconds,
+                    default=DEFAULT_CHAOXING_REQUEST_DELAY_SECONDS,
+                    field_name="external_import.chaoxing.request_delay_seconds",
+                ),
+                init_course_delay_seconds=_normalize_non_negative_float(
+                    init_course_delay_seconds,
+                    default=DEFAULT_CHAOXING_INIT_COURSE_DELAY_SECONDS,
+                    field_name="external_import.chaoxing.init_course_delay_seconds",
+                ),
+            ),
+        ),
+    )
+
+
+def replace_openai_settings(
+    settings: AppSettings,
+    *,
+    provider: str,
+    base_url: str,
+    model: str,
+) -> AppSettings:
+    """派生仅替换 LLM provider / base_url / model 的 `AppSettings`（保留原 api_key）。"""
+    return replace(
+        settings,
+        openai=OpenAISettings(
+            provider=provider,
+            base_url=normalize_openai_base_url(base_url),
+            model=model,
+            api_key=settings.openai.api_key,
+        ),
+    )
+
+
+def _normalize_theme(value: object) -> str:
+    """校验主题枚举，非合法值回退为 `"light"`。"""
+    if isinstance(value, str) and value in VALID_THEMES:
+        return value
+    return "light"
+
+
+def _normalize_transcription_mode(value: object) -> str:
+    """校验转写模式枚举；非合法值回退为 `"fast"`。"""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in VALID_TRANSCRIPTION_MODES:
+            return normalized
+    return "fast"
+
+
+def _normalize_asr_language(value: object) -> str:
+    """校验 ASR 语言配置，`auto` 表示让 provider 自动检测。"""
+    if value is None:
+        return DEFAULT_ASR_LANGUAGE
+    if not isinstance(value, str):
+        raise ValueError("asr.language 必须是语言代码或 auto。")
+    normalized = value.strip().lower()
+    if not normalized:
+        return DEFAULT_ASR_LANGUAGE
+    if normalized == "auto":
+        return normalized
+    if len(normalized) not in {2, 3} or not normalized.isalpha():
+        raise ValueError(f"Unsupported asr.language: {value!r}")
+    return normalized
+
+
+def normalize_openai_base_url(value: str) -> str:
+    """对 OpenAI 兼容 base_url 做归一化（处理 `https://x` ↔ `https://x/v1`）。"""
+    return normalize_provider_base_url(value)
+
+
+def _normalize_http_base_url(value: object, *, default: str, field_name: str) -> str:
+    """校验普通 HTTP base_url，不追加 `/v1`。"""
+    normalized = _normalize_string(value, default=default).rstrip("/")
+    if not normalized.startswith(("http://", "https://")):
+        raise ValueError(f"{field_name} must start with http:// or https://")
+    return normalized
+
+
+def apply_runtime_env_overrides(root_dir: Path) -> None:
+    """把 `.env` 中受支持的环境变量（HF_ENDPOINT 等）写入 `os.environ`。
+
+    这样 huggingface_hub、fastembed 等第三方 SDK 直接 `os.environ.get` 也能
+    拿到镜像配置。
+
+    空值语义是"没有意见"，直接跳过：既不写入也不删除已有变量。`start.bat` /
+    `build_release.ps1` 会把 `HF_HOME` 与 `HUGGINGFACE_HUB_CACHE` 指向项目内目录，
+    若空值执行 `os.environ.pop` 会把这些外部设置抹掉，导致缓存回落到用户目录。
+    """
+    values = _load_dotenv(root_dir / ".env")
+    for key in SUPPORTED_HUGGINGFACE_ENV_KEYS:
+        if key not in values:
+            continue
+        value = values[key].strip()
+        if value:
+            os.environ[key] = value
+    _refresh_loaded_huggingface_hub_endpoint()
+
+
+def _refresh_loaded_huggingface_hub_endpoint() -> None:
+    """同步已导入的 HuggingFace Hub endpoint 常量，避免 FastEmbed 继续使用旧镜像。"""
+    constants = sys.modules.get("huggingface_hub.constants")
+    if constants is None or not hasattr(constants, "ENDPOINT"):
+        return
+    endpoint = os.environ.get("HF_ENDPOINT", "").strip().rstrip("/")
+    if not endpoint:
+        endpoint = getattr(constants, "_HF_DEFAULT_ENDPOINT", "https://huggingface.co")
+    constants.ENDPOINT = endpoint
+
+
+def _render_settings_toml(settings: AppSettings) -> str:
+    """把 `AppSettings` 渲染成可写回 `settings.toml` 的字符串。
+
+    仅渲染"业务配置"部分；OPENAI_* 等 secrets 不写入，留给 .env。
+    """
+    lines = [
+        "[asr]",
+        f'provider = "{settings.asr.provider}"',
+        f'language = "{settings.asr.language}"',
+        f"transcript_enhancement_enabled = {_toml_bool(settings.asr.transcript_enhancement_enabled)}",
+        "",
+        "[asr.faster_whisper]",
+        f'device = "{settings.asr.faster_whisper.device}"',
+        f'model_size = "{settings.asr.faster_whisper.model_size}"',
+        f'compute_type = "{settings.asr.faster_whisper.compute_type}"',
+        f'transcription_mode = "{settings.asr.faster_whisper.transcription_mode}"',
+        f"initial_prompt = {_toml_string(settings.asr.faster_whisper.initial_prompt)}",
+        "",
+        "[asr.whisper_cpp]",
+        f'binary_path = {_toml_string(settings.asr.whisper_cpp.binary_path)}',
+        f'model = {_toml_string(settings.asr.whisper_cpp.model)}',
+        "",
+        "[asr.aliyun_bailian]",
+        f'base_url = "{settings.asr.aliyun_bailian.base_url}"',
+        f'model = "{settings.asr.aliyun_bailian.model}"',
+        "",
+        "[workspace_ui]",
+        f'theme = "{settings.workspace_ui.theme}"',
+        f"show_takeaways = {_toml_bool(settings.workspace_ui.show_takeaways)}",
+        "",
+        "[debug]",
+        f"mode = {_toml_bool(settings.debug.mode)}",
+        "",
+        "[agent_context]",
+        f"window_tokens = {settings.agent_context.window_tokens}",
+        f'answer_detail_level = "{settings.agent_context.answer_detail_level}"',
+        f'reasoning_effort = "{settings.agent_context.reasoning_effort}"',
+        f"talk_custom_prompt = {_toml_string(settings.agent_context.talk_custom_prompt)}",
+        "",
+        "[agent_context.advanced]",
+        f"reserved_output_tokens = {settings.agent_context.reserved_output_tokens}",
+        f"warning_threshold_ratio = {settings.agent_context.warning_threshold_ratio}",
+        f"compact_threshold_ratio = {settings.agent_context.compact_threshold_ratio}",
+        f"blocking_threshold_ratio = {settings.agent_context.blocking_threshold_ratio}",
+        f"keep_tail_messages = {settings.agent_context.keep_tail_messages}",
+        f"projection_max_tokens_ratio = {settings.agent_context.projection_max_tokens_ratio}",
+        f"direct_summary_threshold_ratio = {settings.agent_context.direct_summary_threshold_ratio}",
+        f'planner_transport = "{settings.agent_context.planner_transport}"',
+        "",
+        "[agent_retrieval]",
+        f'embedding_provider = "{settings.agent_retrieval.embedding_provider}"',
+        f'embedding_model = "{settings.agent_retrieval.embedding_model}"',
+        f'embedding_device = "{settings.agent_retrieval.embedding_device}"',
+        f"embedding_batch_size = {settings.agent_retrieval.embedding_batch_size}",
+        f"max_hits = {settings.agent_retrieval.max_hits}",
+        f"rerank_enabled = {_toml_bool(settings.agent_retrieval.rerank_enabled)}",
+        "",
+        f"embedding_endpoint = {_toml_string(settings.agent_retrieval.embedding_endpoint)}",
+        *([f"embedding_dimensions = {settings.agent_retrieval.embedding_dimensions}"] if settings.agent_retrieval.embedding_dimensions is not None else []),
+        f"api_timeout_seconds = {settings.agent_retrieval.api_timeout_seconds}",
+        f"rerank_provider = {_toml_string(settings.agent_retrieval.rerank_provider)}",
+        f"rerank_endpoint = {_toml_string(settings.agent_retrieval.rerank_endpoint)}",
+        f"rerank_model = {_toml_string(settings.agent_retrieval.rerank_model)}",
+        "",
+        "[generation]",
+        f"video_generation_concurrency = {settings.generation.video_generation_concurrency}",
+        f"summary_chunk_concurrency = {settings.generation.summary_chunk_concurrency}",
+        f'chapter_visual_mode = "{settings.generation.chapter_visual_mode}"',
+        f"max_visual_input_images = {settings.generation.max_visual_input_images}",
+        f'note_visual_mode = "{settings.generation.note_visual_mode}"',
+        f"ai_summary_multimodal_enabled = {_toml_bool(settings.generation.ai_summary_multimodal_enabled)}",
+        f'mindmap_visual_input = "{settings.generation.mindmap_visual_input}"',
+        f'cards_visual_input = "{settings.generation.cards_visual_input}"',
+        f"note_max_images = {settings.generation.note_max_images}",
+        f"note_image_min_gap_seconds = {settings.generation.note_image_min_gap_seconds}",
+        f"auto_generate_artifacts = {_toml_string_list(settings.generation.auto_generate_artifacts)}",
+        "",
+        "[web_search]",
+        f"enabled = {_toml_bool(settings.web_search.enabled)}",
+        f'provider = "{settings.web_search.provider}"',
+        f'mode = "{settings.web_search.mode}"',
+        f'search_context_size = "{settings.web_search.search_context_size}"',
+        f"max_results = {settings.web_search.max_results}",
+        f"timeout_seconds = {settings.web_search.timeout_seconds}",
+        "",
+        "[external_import.chaoxing]",
+        f"request_delay_seconds = {settings.external_import.chaoxing.request_delay_seconds}",
+        f"init_course_delay_seconds = {settings.external_import.chaoxing.init_course_delay_seconds}",
+        "",
+        "[external_import.bilibili]",
+        f"request_delay_seconds = {settings.external_import.bilibili.request_delay_seconds}",
+        "",
+        "[external_import.douyin]",
+        f"request_delay_seconds = {settings.external_import.douyin.request_delay_seconds}",
+        "# f2 or ytdlp",
+        f"source = {_toml_string(settings.external_import.douyin.source)}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _toml_bool(value: bool) -> str:
+    """把 bool 渲染为 TOML 字面量（`true` / `false`）。"""
+    return "true" if value else "false"
+
+
+def _toml_string(value: str) -> str:
+    """把字符串渲染为合法的 TOML 字符串字面量（带引号、转义）。"""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _toml_string_list(values: tuple[str, ...]) -> str:
+    return "[" + ", ".join(_toml_string(value) for value in values) + "]"
+
+
+def _normalize_auto_generate_artifacts(value: object) -> tuple[str, ...]:
+    if value is None:
+        return DEFAULT_AUTO_GENERATE_ARTIFACTS
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError("generation.auto_generate_artifacts 必须是字符串数组。")
+    normalized = tuple(dict.fromkeys(item.strip() for item in value if item.strip()))
+    unsupported = set(normalized) - VALID_AUTO_GENERATE_ARTIFACTS
+    if unsupported:
+        raise ValueError(f"generation.auto_generate_artifacts 含不支持的项：{', '.join(sorted(unsupported))}。")
+    return normalized
+
+
+def _normalize_string(value: object, *, default: str) -> str:
+    """把任意值归一为字符串：`None` 用默认；字符串则 strip；其他类型用默认。"""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip()
+    return default
+
+
+def _normalize_positive_int(value: object, *, default: int, field_name: str | None = None) -> int:
+    """校验正整数：`None` 用默认；非正整数抛 `ValueError`（若提供 `field_name`）。"""
+    if value is None:
+        return default
+    if isinstance(value, int) and value > 0:
+        return value
+    if field_name is not None:
+        raise ValueError(f"{field_name} 必须是大于 0 的整数。")
+    return default
+
+
+def _normalize_non_negative_float(value: object, *, default: float, field_name: str) -> float:
+    """校验非负浮点数：`None` 用默认；非法值抛 `ValueError`。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} 必须是大于等于 0 的数字。")
+    if isinstance(value, (int, float)):
+        normalized = float(value)
+        if math.isfinite(normalized) and normalized >= 0:
+            return normalized
+    raise ValueError(f"{field_name} 必须是大于等于 0 的数字。")
+
+
+def _normalize_ratio(value: object, *, default: float) -> float:
+    """校验比例值 `0 < r < 1`；非法回退默认（不抛错）。"""
+    if isinstance(value, (int, float)):
+        normalized = float(value)
+        if 0 < normalized < 1:
+            return normalized
+    return default
+
+
+def _normalize_planner_transport(value: object) -> str:
+    """校验 planner transport 枚举；非合法值回退为 `"structured"`。"""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in VALID_PLANNER_TRANSPORTS:
+            return normalized
+    return "structured"
+
+
+def _normalize_choice(value: object, *, default: str, allowed: set[str], field_name: str) -> str:
+    """通用枚举校验：`None` 用默认；非合法值抛 `ValueError`。"""
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ValueError(f"Unsupported {field_name}: {value!r}. Supported values: {', '.join(sorted(allowed))}")
+    normalized = value.strip().lower()
+    if normalized in allowed:
+        return normalized
+    raise ValueError(f"Unsupported {field_name}: {value!r}. Supported values: {', '.join(sorted(allowed))}")
+
+
+def _normalize_embedding_provider(value: object) -> str:
+    """校验 embedding provider；当前仅支持 `fastembed`。"""
+    normalized = _normalize_non_empty_string(
+        value,
+        default=DEFAULT_AGENT_RETRIEVAL_EMBEDDING_PROVIDER,
+    )
+    if normalized not in {"fastembed", "openai_compatible"}:
+        raise ValueError(f"Unsupported agent_retrieval.embedding_provider: {normalized}")
+    return normalized
+
+
+def _normalize_device(
+    value: object,
+    *,
+    field_name: str,
+    default: str,
+) -> str:
+    """校验设备枚举：`auto` / `cpu` / `gpu`，并把 `cuda` 归一为 `gpu`。"""
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ValueError(
+            f"Unsupported {field_name}: {value!r}. Supported values: auto, cpu, gpu"
+        )
+
+    normalized = value.strip().lower()
+    if normalized == "cuda":
+        return "gpu"
+    if normalized in VALID_DEVICES:
+        return normalized
+    raise ValueError(
+        f"Unsupported {field_name}: {value!r}. Supported values: auto, cpu, gpu"
+    )
+
+
+def _normalize_non_empty_string(value: object, *, default: str) -> str:
+    """返回 strip 后的非空字符串；空字符串或非字符串回退默认。"""
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized:
+            return normalized
+    return default
+
+
+@dataclass(frozen=True)
+class EnvSettings:
+    """`.env` 中需要被显式建模的 secrets/配置。
+
+    Attributes:
+        provider: LLM provider 标识。
+        base_url: OpenAI 兼容 base_url。
+        model: 模型名称。
+        api_key: API Key。
+        hf_endpoint: HuggingFace 镜像 URL。
+    """
+
+    provider: str
+    base_url: str
+    model: str
+    api_key: str
+    hf_endpoint: str = ""
+    dashscope_api_key: str = ""
+
+
+def load_env_settings(root_dir: Path) -> EnvSettings:
+    """从 `.env` 中读取 LLM 相关配置，构造 `EnvSettings`。"""
+    values = {**os.environ, **_load_dotenv(root_dir / ".env")}
+    return EnvSettings(
+        provider=_normalize_env_provider(values.get("OPENAI_PROVIDER")),
+        base_url=normalize_openai_base_url(values.get("OPENAI_BASE_URL", "").strip()),
+        model=values.get("OPENAI_MODEL", "").strip(),
+        api_key=values.get("OPENAI_API_KEY", "").strip(),
+        hf_endpoint=values.get("HF_ENDPOINT", "").strip(),
+        dashscope_api_key=values.get("DASHSCOPE_API_KEY", "").strip(),
+    )
+
+
+def save_env_settings(root_dir: Path, settings: EnvSettings) -> None:
+    """把 `EnvSettings` 写回 `.env`：保留其他行、就地替换 5 个受支持 key、缺失 key 追加。"""
+    dotenv_path = root_dir / ".env"
+    lines = dotenv_path.read_text(encoding="utf-8").splitlines() if dotenv_path.exists() else []
+    replacements = {
+        "OPENAI_PROVIDER": settings.provider,
+        "OPENAI_BASE_URL": normalize_openai_base_url(settings.base_url),
+        "OPENAI_MODEL": settings.model,
+        "OPENAI_API_KEY": settings.api_key,
+        "HF_ENDPOINT": settings.hf_endpoint.strip(),
+        "DASHSCOPE_API_KEY": settings.dashscope_api_key.strip(),
+    }
+    next_lines: list[str] = []
+    seen_keys: set[str] = set()
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in raw_line:
+            next_lines.append(raw_line)
+            continue
+
+        key, _ = raw_line.split("=", 1)
+        normalized_key = key.strip()
+        if normalized_key in replacements:
+            next_lines.append(f"{normalized_key}={replacements[normalized_key]}")
+            seen_keys.add(normalized_key)
+        else:
+            next_lines.append(raw_line)
+
+    for key, value in replacements.items():
+        if key not in seen_keys:
+            next_lines.append(f"{key}={value}")
+
+    atomic_write_text(dotenv_path, "\n".join(next_lines).rstrip() + "\n")
+
+
+def _load_dotenv(dotenv_path: Path) -> dict[str, str]:
+    """解析 `.env` 为 dict；同时把解析到的值通过 `os.environ.setdefault` 注入环境。"""
+    if not dotenv_path.exists():
+        return {}
+
+    values: dict[str, str] = {}
+    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        normalized_key = key.strip()
+        normalized_value = value.strip().strip('"').strip("'")
+        if normalized_key:
+            values[normalized_key] = normalized_value
+    # 顺手把 .env 里的值灌进 os.environ——这样 BILIBILI_COOKIE / BILIBILI_SESSDATA
+    # 这类不需要 EnvSettings 显式建模的变量也能被子进程和 os.environ.get 拿到。
+    # 空的 HuggingFace 变量表示"本文件不表态"，直接跳过：既不能把空字符串暴露给
+    # huggingface_hub（它会拼出没有 scheme 的相对 URL），也不能删除外部已设的值——
+    # `start.bat` / `build_release.ps1` 会设 HF_HOME 与 HUGGINGFACE_HUB_CACHE 指向
+    # 项目内目录，删掉会让缓存回落到用户目录。
+    # 用 setdefault 尊重 shell 里已经显式设的值。
+    for k, v in values.items():
+        if k in SUPPORTED_HUGGINGFACE_ENV_KEYS and not v:
+            continue
+        os.environ.setdefault(k, v)
+    return values
+
+
+def _normalize_env_provider(value: object) -> str:
+    """归一化并校验 `OPENAI_PROVIDER`，兼容协议使用 `openai`。"""
+    if not isinstance(value, str):
+        return "openai"
+    normalized = value.strip().lower()
+    if not normalized or normalized == "openai_compatible":
+        return "openai"
+    if normalized not in VALID_LLM_PROVIDERS:
+        raise ValueError(f"unsupported llm provider '{normalized}'")
+    return normalized
